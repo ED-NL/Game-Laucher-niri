@@ -1,0 +1,8 @@
+[Desktop Entry]
+Name=Mortal Kombat 1 (gamescope)
+Comment=Lanza Mortal Kombat 1 dentro de gamescope: evita el cuelgue de imagen en niri
+Exec=/home/spawnenl/Games/MortalKombat1-gamescope.sh
+Icon=/home/spawnenl/.cache/gamelauncher/heroic/wYrFs3Xd1S1JpeNYzDo9jv.jpg
+Terminal=false
+Type=Application
+Categories=Game;

@@ -1,0 +1,14 @@
+[plugins]
+auto_update = "none"
+enabled = [
+    "dotnetrob/cat",
+    "avivbintangaringga/nix-monitor",
+    "tmelik/system-monitor",
+    "remo/noctes",
+    "ashur-d/wallpaper-widget",
+    "vn1k/cursor",
+    "spawnenl/niriEQ",
+    "alexander/game-launcher",
+    "johnnyp0t/niri-workspace-stack"
+]
+

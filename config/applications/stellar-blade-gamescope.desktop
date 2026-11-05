@@ -1,0 +1,8 @@
+[Desktop Entry]
+Name=Stellar Blade (gamescope)
+Comment=Lanza Stellar Blade dentro de gamescope: evita el cuelgue de imagen en niri
+Exec=/home/spawnenl/Games/StellarBlade-gamescope.sh
+Icon=/home/spawnenl/.var/app/io.github.Faugus.faugus-launcher/data/faugus-launcher/icons/stellar-blade.png
+Terminal=false
+Type=Application
+Categories=Game;

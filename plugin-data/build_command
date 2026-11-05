@@ -1,0 +1,1 @@
+cc -o /home/spawnenl/.local/state/noctalia/plugins/materialized/community/game-launcher/gamelauncher /home/spawnenl/.local/state/noctalia/plugins/materialized/community/game-launcher/gamelauncher.c /home/spawnenl/.local/state/noctalia/plugins/materialized/community/game-launcher/sqlite_reader.c

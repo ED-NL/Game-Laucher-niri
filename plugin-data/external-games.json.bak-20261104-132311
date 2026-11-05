@@ -1,0 +1,20 @@
+[
+  {
+    "cover": "/home/spawnenl/.local/state/noctalia/plugins/data/alexander/game-launcher/covers/callofdutymodernwarfare42026.jpg",
+    "cover_url": "",
+    "exe": "/run/media/spawnenl/L/game/Call of Duty Modern Warfare 4 2026/cod.exe",
+    "id": "callofdutymodernwarfare42026",
+    "name": "Call of Duty Modern Warfare 4 2026",
+    "runner": "external",
+    "autoCover": true
+  },
+  {
+    "cover": "/home/spawnenl/.cache/gamelauncher/steam/carmageddonrogueshift_p.jpg",
+    "cover_url": "",
+    "exe": "/run/media/spawnenl/L/game/Carmageddon Rogue Shift/Carma.exe",
+    "id": "carmageddonrogueshift",
+    "name": "Carmageddon Rogue Shift",
+    "runner": "external",
+    "autoCover": true
+  }
+]

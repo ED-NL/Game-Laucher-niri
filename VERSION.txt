@@ -1,5 +1,13 @@
-Fecha: 2026-11-04T23:19:27-03:00
+Fecha: 2026-11-04T23:28:15-03:00
 Noctalia: noctalia v5.4.1 (5.4.1-1-dirty)
 Plugin: version = "1.5.1"
 Plugin API: plugin_api = 21
 Commit fuente: 34209752
+Juegos en games.json: 20
+Juegos externos (Faugus): 2
+Juegos de escritorio añadidos: 2 (ctr-nitro-fueled, infamous-second-son)
+Portadas de Steam: 28
+Portadas de Heroic: 6
+Portadas propias: 2
+Discos generados: 21
+Accesos directos (.desktop): 11

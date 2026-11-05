@@ -1,0 +1,8 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Mortal Shell II (gamescope)
+Exec=/home/spawnenl/Games/MortalShell2-gamescope.sh
+Icon=mortal-shell-2
+Terminal=false
+Categories=Game;

@@ -1,0 +1,8 @@
+[Desktop Entry]
+Name=Gears E-Day (gamescope)
+Comment=Lanza Gears E-Day dentro de gamescope: evita el cuelgue de imagen en niri
+Exec=/home/spawnenl/Games/GearsEDay-gamescope.sh
+Icon=/home/spawnenl/.cache/gamelauncher/heroic/oBGHaGMMJWKxZQTNhhpsqB.jpg
+Terminal=false
+Type=Application
+Categories=Game;

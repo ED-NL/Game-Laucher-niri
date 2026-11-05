@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Epic Games Launcher
+Name[es]=Epic Games Launcher
+Comment=Epic Games Launcher
+Exec=/home/spawnenl/Applications/EpicGamesLauncher.AppImage %u
+Icon=EpicGamesLauncher
+Terminal=false
+Categories=Game;
+StartupWMClass=EpicGamesLauncher
+MimeType=x-scheme-handler/com.epicgames.launcher;

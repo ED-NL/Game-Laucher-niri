@@ -1,0 +1,19 @@
+[
+  {
+    "cover": "/home/spawnenl/.cache/gamelauncher/steam/carmageddonrogueshift_p.jpg",
+    "cover_url": "",
+    "exe": "/run/media/spawnenl/L/game/Carmageddon Rogue Shift/Carma.exe",
+    "id": "carmageddonrogueshift",
+    "name": "Carmageddon Rogue Shift",
+    "runner": "external",
+    "autoCover": true
+  },
+  {
+    "id": "united4",
+    "name": "Uncharted 4 Legacy of Thieves Collection",
+    "runner": "external",
+    "cover": "/home/spawnenl/.local/state/noctalia/plugins/data/alexander/game-launcher/covers/uncharted4.jpg",
+    "exe": "/run/media/spawnenl/enl/GAME/Uncharted 4 Legacy of Thieves Collection/u4.exe",
+    "autoCover": true
+  }
+]

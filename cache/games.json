@@ -1,0 +1,182 @@
+[
+  {
+    "id": "3393110",
+    "name": "AION 2",
+    "runner": "steam",
+    "cover": "/home/spawnenl/.cache/gamelauncher/steam/3393110.jpg",
+    "cover_url": "",
+    "run_command": "steam://rungameid/3393110",
+    "slug": ""
+  },
+  {
+    "id": "350470",
+    "name": "appid_350470",
+    "runner": "steam",
+    "cover": "",
+    "cover_url": "",
+    "run_command": "steam://rungameid/350470",
+    "slug": ""
+  },
+  {
+    "id": "582660",
+    "name": "Black Desert",
+    "runner": "steam",
+    "cover": "/home/spawnenl/.cache/gamelauncher/steam/582660.jpg",
+    "cover_url": "",
+    "run_command": "steam://rungameid/582660",
+    "slug": ""
+  },
+  {
+    "id": "233610",
+    "name": "Distance",
+    "runner": "steam",
+    "cover": "/home/spawnenl/.cache/gamelauncher/steam/233610.jpg",
+    "cover_url": "",
+    "run_command": "steam://rungameid/233610",
+    "slug": ""
+  },
+  {
+    "id": "oBGHaGMMJWKxZQTNhhpsqB",
+    "name": "Gears E-Day",
+    "runner": "heroic",
+    "cover": "",
+    "cover_url": "https://cdn2.steamgriddb.com/grid/8ea3be398039de26c9bf42a2791fcac3.png",
+    "run_command": "heroic://launch/sideload/oBGHaGMMJWKxZQTNhhpsqB",
+    "slug": ""
+  },
+  {
+    "id": "1426210",
+    "name": "It Takes Two",
+    "runner": "steam",
+    "cover": "/home/spawnenl/.cache/gamelauncher/steam/1426210.jpg",
+    "cover_url": "",
+    "run_command": "steam://rungameid/1426210",
+    "slug": ""
+  },
+  {
+    "id": "557180",
+    "name": "League of Maidens",
+    "runner": "steam",
+    "cover": "/home/spawnenl/.cache/gamelauncher/steam/557180.jpg",
+    "cover_url": "",
+    "run_command": "steam://rungameid/557180",
+    "slug": ""
+  },
+  {
+    "id": "rBcHwoL7CC63xKwPYPKmRv",
+    "name": "Marvels Spider-Man Remastered",
+    "runner": "heroic",
+    "cover": "",
+    "cover_url": "https://cdn2.steamgriddb.com/grid/a85d6bc329aeaf43fe76fbb48b8b9325.png",
+    "run_command": "heroic://launch/sideload/rBcHwoL7CC63xKwPYPKmRv",
+    "slug": ""
+  },
+  {
+    "id": "wYrFs3Xd1S1JpeNYzDo9jv",
+    "name": "Mortal Kombat 1",
+    "runner": "heroic",
+    "cover": "",
+    "cover_url": "https://cdn2.steamgriddb.com/grid/1ca03569d36f6dba22a6e791da327083.png",
+    "run_command": "heroic://launch/sideload/wYrFs3Xd1S1JpeNYzDo9jv",
+    "slug": ""
+  },
+  {
+    "id": "tTTBueDFsP4vqXZT2sY3Ch",
+    "name": "Mortal Shell II",
+    "runner": "heroic",
+    "cover": "",
+    "cover_url": "https://cdn2.steamgriddb.com/grid/de51c41f2ede1364ca77c2818c875cf5.png",
+    "run_command": "heroic://launch/sideload/tTTBueDFsP4vqXZT2sY3Ch",
+    "slug": ""
+  },
+  {
+    "id": "275850",
+    "name": "No Man's Sky",
+    "runner": "steam",
+    "cover": "/home/spawnenl/.cache/gamelauncher/steam/275850.jpg",
+    "cover_url": "",
+    "run_command": "steam://rungameid/275850",
+    "slug": ""
+  },
+  {
+    "id": "967050",
+    "name": "Pacify",
+    "runner": "steam",
+    "cover": "/home/spawnenl/.cache/gamelauncher/steam/967050.jpg",
+    "cover_url": "",
+    "run_command": "steam://rungameid/967050",
+    "slug": ""
+  },
+  {
+    "id": "3527290",
+    "name": "PEAK",
+    "runner": "steam",
+    "cover": "/home/spawnenl/.cache/gamelauncher/steam/3527290.jpg",
+    "cover_url": "",
+    "run_command": "steam://rungameid/3527290",
+    "slug": ""
+  },
+  {
+    "id": "221040",
+    "name": "Resident Evil 6",
+    "runner": "steam",
+    "cover": "/home/spawnenl/.cache/gamelauncher/steam/221040.jpg",
+    "cover_url": "",
+    "run_command": "steam://rungameid/221040",
+    "slug": ""
+  },
+  {
+    "id": "psPUioQYT4Co2fJg4LqB1J",
+    "name": "Stellar Blade",
+    "runner": "heroic",
+    "cover": "",
+    "cover_url": "https://cdn2.steamgriddb.com/grid/f22df27d9bd4489d4f54c852bbdb21fa.jpg",
+    "run_command": "heroic://launch/sideload/psPUioQYT4Co2fJg4LqB1J",
+    "slug": ""
+  },
+  {
+    "id": "105600",
+    "name": "Terraria",
+    "runner": "steam",
+    "cover": "/home/spawnenl/.cache/gamelauncher/steam/105600.jpg",
+    "cover_url": "",
+    "run_command": "steam://rungameid/105600",
+    "slug": ""
+  },
+  {
+    "id": "2074920",
+    "name": "The First Descendant",
+    "runner": "steam",
+    "cover": "/home/spawnenl/.cache/gamelauncher/steam/2074920.jpg",
+    "cover_url": "",
+    "run_command": "steam://rungameid/2074920",
+    "slug": ""
+  },
+  {
+    "id": "5zgkqnNxg2zqKdHvnT27cT",
+    "name": "The Witcher 3 Wild Hunt Remastered",
+    "runner": "heroic",
+    "cover": "",
+    "cover_url": "https://cdn2.steamgriddb.com/grid/4904f82c12cecf6ec070fe77d7e913ce.png",
+    "run_command": "heroic://launch/sideload/5zgkqnNxg2zqKdHvnT27cT",
+    "slug": ""
+  },
+  {
+    "id": "2221490",
+    "name": "Tom Clancy's The Division 2",
+    "runner": "steam",
+    "cover": "/home/spawnenl/.cache/gamelauncher/steam/2221490.jpg",
+    "cover_url": "",
+    "run_command": "steam://rungameid/2221490",
+    "slug": ""
+  },
+  {
+    "id": "431960",
+    "name": "Wallpaper Engine",
+    "runner": "steam",
+    "cover": "/home/spawnenl/.cache/gamelauncher/steam/431960.jpg",
+    "cover_url": "",
+    "run_command": "steam://rungameid/431960",
+    "slug": ""
+  }
+]
