@@ -1982,7 +1982,6 @@ local function renderGameRow(g, index)
     opacity = isLaunching and 1 or (launching and 0.25 or (focused and 1 or (1 - 0.45 * dim))),
     onHover = "onCardHover",
     onClick = activate,
-    tooltip = g.name .. " · " .. badge.label,
   }, {
     ui.column({ width = STAND_W, align = "center", justify = "center", gap = 3 }, { caseWidget, shelf }),
     ui.column({ flexGrow = 1, justify = "center", gap = 5 }, {
