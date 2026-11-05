@@ -577,7 +577,6 @@ a2c81a6f42725b392468c7dedf9181f52d822aac4e1b84d844912a01d66f0e73  ./cache/steam/
 fc3e39bf7e58c504a38b3e9685a716b381216281d132f164d648b00748a1df30  ./cache/steam/967050.jpg
 6c4a13a545064e5e689d93a5aaf3f9089f63b2eda4027f04cca1943b093b0eb4  ./cache/steam/967050_p.jpg
 09a3719655a8b1d36c08adbf823b6bdf27d1306073b9568acde1499a4d5c8604  ./cache/steam/carmageddonrogueshift_p.jpg
-bb5b6ef261a57dae189c5f2c02cf5f0e6c69e85ede87e5e7142ccca6cb48d508  ./CHECKSUMS.sha256
 822d267767e4da05001f422b60da26a956aaa52f1d0daa1c99d94f747fb80edf  ./config/applications/ctr-nitro-fueled.desktop
 8ad4563744c89eb0b751a4b9bf7882bbd7f3f0a842f8713d040310a45d67b6c0  ./config/applications/ctr-nitro-fueled-launcher.desktop
 8dfd3472cd0aada587218f629c50637da93dbbc04dbef8990f21ac2911f68a3d  ./config/applications/epic-games-launcher.desktop
@@ -630,4 +629,4 @@ f51211c0d69d6847c3b5648c8ae6995465ddad74844f4d65597c1213e115464b  ./plugin/widge
 edfae736c3ec9724436a654c67bc7ad7984546c25caadcf8233ecbffa7de119e  ./README.md
 0fa577f1fa452efaf7cb6cad213df7b24461cdd3598447257398f6d1aa390454  ./tools/reapply-noctalia-patches.sh
 4c285b7a6f556b0ea868271b0efa960554459afb4ba52d0e5e9b1e2e955f2c04  ./tools/restore.sh
-81a8b4c2769a632dcd8b8087d8741726fe8563a1d8bad93a5a415e78aacb4c63  ./VERSION.txt
+80be48e14a1a56b2cfd9b5273cb046dff3a28469fb6c2d02deaa7916ee8fae52  ./VERSION.txt
