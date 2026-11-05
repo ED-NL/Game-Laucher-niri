@@ -1,0 +1,5 @@
+Fecha: 2026-11-04T23:19:27-03:00
+Noctalia: noctalia v5.4.1 (5.4.1-1-dirty)
+Plugin: version = "1.5.1"
+Plugin API: plugin_api = 21
+Commit fuente: 34209752

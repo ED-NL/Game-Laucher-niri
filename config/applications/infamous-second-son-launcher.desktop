@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=inFAMOUS Second Son - Launcher (settings)
+Comment=iss_pc launcher: game folder, graphics, controls, fixes, saves
+Exec=/home/spawnenl/.local/bin/Apps/InFAMOUSSecondSon-IssPc/launcher.sh
+Icon=/home/spawnenl/.local/bin/Apps/InFAMOUSSecondSon-IssPc/launcher/infamous.png
+Terminal=false
+Categories=Game;
+StartupWMClass=infamous-launcher

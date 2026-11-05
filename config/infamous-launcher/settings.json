@@ -1,0 +1,11 @@
+{
+  "settings_rev": 2,
+  "game": "CUSA00004",
+  "game_dir": "/run/media/spawnenl/L/game/ISS-SecondSon-CUSA00004",
+  "game_language": "es",
+  "ui_language": "auto",
+  "display_mode": "Borderless",
+  "vsync": true,
+  "show_fps": false,
+  "precompile_shaders": true
+}

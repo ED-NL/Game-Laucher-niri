@@ -1,0 +1,1 @@
+21:    Mod+Z                               hotkey-overlay-title="Open Game Launcher" { spawn-sh "noctalia msg panel-toggle alexander/game-launcher:original"; }

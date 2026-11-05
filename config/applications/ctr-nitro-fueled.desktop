@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Crash Team Racing Nitro-Fueled
+Comment=OCTR / SacredFire native PC port (uses your own CUSA13795 dump)
+Exec=/home/spawnenl/.local/bin/Apps/CrashTeamRacingNitroFueled-CTRNitroFueledPC/launch.sh
+Icon=applications-games
+Terminal=false
+Categories=Game;
+StartupWMClass=sacredfire

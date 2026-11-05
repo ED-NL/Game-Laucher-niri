@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=inFAMOUS Second Son
+Comment=Native PC port (HayatoG/iss_pc) — uses your own CUSA00004 dump
+Exec=/home/spawnenl/.local/bin/Apps/InFAMOUSSecondSon-IssPc/launch.sh
+Icon=/home/spawnenl/.local/bin/Apps/InFAMOUSSecondSon-IssPc/launcher/infamous.png
+Terminal=false
+Categories=Game;
+StartupWMClass=infamous-launcher

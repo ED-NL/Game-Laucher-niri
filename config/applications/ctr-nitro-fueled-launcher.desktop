@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Crash Team Racing - Launcher (settings)
+Comment=SacredFire launcher: game folder, controller, patches, DLC, online
+Exec=/home/spawnenl/.local/bin/Apps/CrashTeamRacingNitroFueled-CTRNitroFueledPC/launcher.sh
+Icon=io.github.sacredfire.Launcher
+Terminal=false
+Categories=Game;
