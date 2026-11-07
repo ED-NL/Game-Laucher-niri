@@ -67,34 +67,38 @@ local STATE_GAMES = "gl_games"
 -- contexto de panel-open: si el host no lo entrega, la ventana nueva sigue
 -- sabiendo si debe nacer horizontal o vertical.
 local STATE_LAYOUT = "gl_layout"
--- Rueda del ratón en el carrusel horizontal. Algunos builds no entregan el
--- hook global onScroll a los paneles, así que el carrusel apaisado vive
--- dentro de un ui.scroll con un espaciador guía: la rueda cambia el offset,
--- el onScroll del contenedor lo traduce a mover la selección (como las
--- flechas) y el espaciador se ajusta al offset para que las cajas no se
--- desplacen. JUKEBOX_GUIDE da margen para girar en ambos sentidos.
-local JUKEBOX_GUIDE = 2000
--- Hueco que deja el carrusel bajo el ancla para que quede centrado en la
--- ventana apaisada (el ui.scroll no permite centrar el contenido a mano).
+-- Rueda del ratón en el carrusel horizontal. Los paneles no siempre entregan
+-- el hook global onScroll, así que el carrusel vive dentro de un ui.scroll.
+-- El offset inicial lo fija un ancla diminuta (revealKey) que está fuera de
+-- la vista a offset 0; a partir de ahí, el espaciador superior se ajusta a
+-- cada paso para que las cajas queden siempre a la misma altura. El reveal se
+-- mantiene hasta que el contenedor confirma el offset: si se borrara antes,
+-- el panel podía quedarse en negro mostrando sólo el espaciador.
+local JB_REST_OFFSET = 650
+-- Hueco entre el espaciador y la fila para que el carrusel quede centrado.
 local JB_WIDE_TOP_GAP = 90
-local jbGuideTop = JUKEBOX_GUIDE
-local jbLastOffset = JUKEBOX_GUIDE
-local jbReveal = "jb-anchor"
+local JB_STRIP_KEY = "jb-strip"
+local jbGuideTop = JB_REST_OFFSET
+local jbLastOffset = JB_REST_OFFSET
+local jbReveal = JB_STRIP_KEY
 local jbScrollAccum = 0
 local jbInit = false
 -- Los primeros onScroll vienen del revealKey/colocación inicial, no de la
 -- rueda. Se ignoran durante un instante para que abrir el panel no cambie de
 -- juego por sí solo.
 local jbIgnoreUntil = 0
+local jbOpenedAt = 0
 
 local function resetJukeboxScroll()
-  jbGuideTop = JUKEBOX_GUIDE
-  jbLastOffset = JUKEBOX_GUIDE
-  jbReveal = "jb-anchor"
+  jbGuideTop = JB_REST_OFFSET
+  jbLastOffset = JB_REST_OFFSET
+  jbReveal = JB_STRIP_KEY
   jbScrollAccum = 0
   jbInit = false
   local ok, now = pcall(noctalia.nowMs)
-  jbIgnoreUntil = (ok and tonumber(now) or 0) + 700
+  local ms = ok and tonumber(now) or 0
+  jbIgnoreUntil = ms + 700
+  jbOpenedAt = ms
 end
 
 -- Forward-declared: the browse helpers below need to repaint before render()
@@ -2367,41 +2371,52 @@ local function renderJukebox()
 end
 
 -- Rueda en el carrusel apaisado: el ui.scroll entrega (offset, maxOffset).
--- Traducimos el cambio de offset a mover la selección y anclamos el espaciador
--- al offset para que las cajas no se desplacen visualmente.
+-- Cada paso de rueda mueve la selección y recoloca el espaciador para que las
+-- cajas sigan a la misma altura; no hace falta volver a hacer reveal.
 local function onJukeboxScroll(offset, _maxOffset)
   local off = math.floor(tonumber(offset) or 0)
   local ok, nowRaw = pcall(noctalia.nowMs)
   local now = ok and tonumber(nowRaw) or 0
-  if now < jbIgnoreUntil then
-    -- Reveal/colocación inicial: sincroniza sin cambiar de juego.
+  if not jbInit then
+    -- Colocación inicial (reveal o primer scroll): fija el reposo.
     jbInit = true
     jbLastOffset = off
     jbGuideTop = off
+    jbReveal = nil
     return
   end
-  if not jbInit then
-    jbInit = true
+  if now < jbIgnoreUntil then
     jbLastOffset = off
-    jbGuideTop = off
     return
   end
   local delta = off - jbLastOffset
   if delta == 0 then return end
   jbLastOffset = off
-  jbGuideTop = off
   jbScrollAccum = jbScrollAccum + delta
   -- Un paso de rueda típico son ~50 px; así una muesca mueve un juego.
   local step = 50
+  local moves = 0
   while math.abs(jbScrollAccum) >= step do
     if jbScrollAccum > 0 then
-      moveJukebox(1)
+      moves = moves + 1
       jbScrollAccum = jbScrollAccum - step
     else
-      moveJukebox(-1)
+      moves = moves - 1
       jbScrollAccum = jbScrollAccum + step
     end
   end
+  if moves == 0 or #filtered == 0 then return end
+  selectedIndex = selectedIndex + moves
+  if selectedIndex < 0 then selectedIndex = #filtered - 1 end
+  if selectedIndex >= #filtered then selectedIndex = 0 end
+  expandedId = nil
+  optionIndex = 0
+  hoveredId = nil
+  ensureTicks(true)
+  -- Mantiene el carrusel a la misma altura con el offset nuevo.
+  jbGuideTop = off
+  jbScrollAccum = 0
+  render()
 end
 
 -- Ventana apaisada: los datos del juego a la izquierda y el carrusel al lado,
@@ -2411,8 +2426,9 @@ end
 -- del ratón funcione igual que las flechas aunque el panel no entregue el
 -- hook global onScroll.
 local function renderJukeboxWide()
+  -- No se consume: el host lo reaplica cuando el hijo aparece, y así el panel
+  -- no se queda en negro si el primer render no tenía aún la fila de cajas.
   local reveal = jbReveal
-  jbReveal = nil
   return ui.row({ flexGrow = 1, gap = 14, align = "stretch" }, {
     ui.column({ width = 260, gap = 10, justify = "center" }, {
       renderSearchBar(),
@@ -2437,16 +2453,13 @@ local function renderJukeboxWide()
         revealKey = reveal,
         onScroll = function(offset, maxOffset) onJukeboxScroll(offset, maxOffset) end,
       }, {
-        ui.column({ gap = 0, flexGrow = 1 }, {
-          -- El ancla debe ser diminuta: revealKey la lleva al borde superior
-          -- del viewport y así el carrusel queda siempre a la misma altura.
-          ui.box({ height = math.max(0, jbGuideTop - 1) }),
-          ui.box({ key = "jb-anchor", height = 1 }),
+        ui.column({ gap = 0 }, {
+          ui.box({ height = jbGuideTop }),
           ui.box({ height = JB_WIDE_TOP_GAP }),
-          ui.column({ justify = "center", flexGrow = 1, minHeight = 1, minWidth = 0 }, {
+          ui.column({ key = JB_STRIP_KEY, justify = "center", minHeight = 1, minWidth = 0 }, {
             renderJukeboxStrip(),
           }),
-          ui.box({ height = JUKEBOX_GUIDE }),
+          ui.box({ height = 2000 }),
         }),
       }),
     }),
@@ -2523,13 +2536,13 @@ local function toggleViewMode()
   hoveredId = nil
   expandedId = nil
   optionIndex = 0
+  -- El panel manager cierra esta ventana al abrir la otra; no cerramos aquí
+  -- porque el panel-open es asíncrono y podía cerrar la ventana recién abierta.
   if horizontalMode then
     openLauncherPanel("original", "vertical")
   else
     openLauncherPanel("horizontal", "jukebox")
   end
-  -- Cierra esta ventana; la otra se abre por IPC y mantiene el juego/búsqueda.
-  panel.close()
 end
 
 local function renderTabs()
@@ -2929,6 +2942,21 @@ end
 function onFrameTick(deltaMs)
   local dt = tonumber(deltaMs) or 16
 
+  -- Red de seguridad: si el reveal inicial no llegó a colocar el scroll,
+  -- muestra el carrusel arriba en vez de dejar el panel en negro.
+  if horizontalMode and not jbInit and jbOpenedAt > 0 then
+    local ok, nowRaw = pcall(noctalia.nowMs)
+    local now = ok and tonumber(nowRaw) or 0
+    if now - jbOpenedAt > 1200 then
+      jbInit = true
+      jbGuideTop = 0
+      jbLastOffset = 0
+      jbReveal = nil
+      render()
+      return
+    end
+  end
+
   if launchingId then
     -- La caja abierta manda: ni hover ni crecimiento mientras se lanza.
     launchElapsed = launchElapsed + dt
@@ -3299,10 +3327,11 @@ function onIpc(event, payload)
   elseif event == "status" then
     local jbFirst, jbLast = jukeboxRange()
     noctalia.log(string.format(
-      "game-launcher status: vista=%s horiz=%s tab=%s path=[%s] disks=%s entradas=%d visibles=%d browseSel=%d gameSel=%d err=[%s] juegos=%d filtrados=%d jbBase=%d jbVis=%d jbRango=%d-%d",
+      "game-launcher status: vista=%s horiz=%s tab=%s path=[%s] disks=%s entradas=%d visibles=%d browseSel=%d gameSel=%d err=[%s] juegos=%d filtrados=%d jbBase=%d jbVis=%d jbRango=%d-%d jbInit=%s jbTop=%d jbLast=%d jbRev=%s",
       viewMode, tostring(horizontalMode), activeTab, browsePath, tostring(browseDisks), #browseEntries, #browseFiltered,
       browseIndex, selectedIndex, browseError, #games, #filtered,
-      JUKEBOX_BASE_H, horizontalMode and JUKEBOX_VISIBLE_WIDE or JUKEBOX_VISIBLE, jbFirst, jbLast))
+      JUKEBOX_BASE_H, horizontalMode and JUKEBOX_VISIBLE_WIDE or JUKEBOX_VISIBLE, jbFirst, jbLast,
+      tostring(jbInit), jbGuideTop, jbLastOffset, tostring(jbReveal)))
   elseif event == "names" then
     -- Diagnóstico: lista los juegos realmente visibles (nombre[y runner])
     local out = {}
