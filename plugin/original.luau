@@ -41,6 +41,62 @@ end)
 -- never changes, so the wheel's offset-to-index maths stays exact.
 local ROW_H = 226
 
+-- Vista del panel: "shelf" es la estantería vertical de siempre y "jukebox"
+-- la fila horizontal estilo NonDot GameLibrary. La ventana horizontal enseña
+-- solo unas cuantas cajas alrededor de la seleccionada porque ui.scroll es
+-- vertical: no hay scroll horizontal nativo.
+local viewMode = "shelf"
+-- True cuando este runtime es el panel apaisado ([[panel]] id="horizontal").
+-- La misma entrada original.luau sirve a las dos ventanas: el contexto que
+-- pasa `noctalia msg panel-open ... jukebox` decide la orientación. Así no
+-- hay que mantener dos copias del script.
+local horizontalMode = false
+local JUKEBOX_VISIBLE = 4
+local JUKEBOX_BASE_H = 175
+-- La ventana apaisada puede permitirse cajas más grandes.
+local JUKEBOX_WIDE_BASE_H = 210
+-- En apaisado caben menos con holgura; se ajusta al abrir según el modo.
+local JUKEBOX_VISIBLE_WIDE = 3
+-- Clave de estado para que al cambiar de ventana el juego seleccionado y la
+-- búsqueda no se pierdan. noctalia.state es memoria compartida entre las
+-- entradas del mismo plugin (las dos ventanas son VMs distintas).
+local STATE_SELECTED = "gl_selected_id"
+local STATE_SEARCH = "gl_search_text"
+local STATE_GAMES = "gl_games"
+-- Orientación pedida por la ventana que abre a la otra. Es un respaldo del
+-- contexto de panel-open: si el host no lo entrega, la ventana nueva sigue
+-- sabiendo si debe nacer horizontal o vertical.
+local STATE_LAYOUT = "gl_layout"
+-- Rueda del ratón en el carrusel horizontal. Algunos builds no entregan el
+-- hook global onScroll a los paneles, así que el carrusel apaisado vive
+-- dentro de un ui.scroll con un espaciador guía: la rueda cambia el offset,
+-- el onScroll del contenedor lo traduce a mover la selección (como las
+-- flechas) y el espaciador se ajusta al offset para que las cajas no se
+-- desplacen. JUKEBOX_GUIDE da margen para girar en ambos sentidos.
+local JUKEBOX_GUIDE = 2000
+-- Hueco que deja el carrusel bajo el ancla para que quede centrado en la
+-- ventana apaisada (el ui.scroll no permite centrar el contenido a mano).
+local JB_WIDE_TOP_GAP = 90
+local jbGuideTop = JUKEBOX_GUIDE
+local jbLastOffset = JUKEBOX_GUIDE
+local jbReveal = "jb-anchor"
+local jbScrollAccum = 0
+local jbInit = false
+-- Los primeros onScroll vienen del revealKey/colocación inicial, no de la
+-- rueda. Se ignoran durante un instante para que abrir el panel no cambie de
+-- juego por sí solo.
+local jbIgnoreUntil = 0
+
+local function resetJukeboxScroll()
+  jbGuideTop = JUKEBOX_GUIDE
+  jbLastOffset = JUKEBOX_GUIDE
+  jbReveal = "jb-anchor"
+  jbScrollAccum = 0
+  jbInit = false
+  local ok, now = pcall(noctalia.nowMs)
+  jbIgnoreUntil = (ok and tonumber(now) or 0) + 700
+end
+
 -- Forward-declared: the browse helpers below need to repaint before render()
 -- is defined further down, and they call each other before their own bodies.
 local render
@@ -111,6 +167,27 @@ local function revealBrowse()
   else
     revealKey = "browse_" .. browseIndex
   end
+end
+
+-- Guarda la selección y la búsqueda para la otra ventana (vertical u
+-- horizontal). Las dos entradas del plugin son VMs separadas, así que la
+-- única forma de continuar en el mismo juego es pasarlo por noctalia.state.
+local function rememberSelection()
+  local g = filtered[selectedIndex + 1]
+  pcall(noctalia.state.set, STATE_SELECTED, g and g.id or "")
+  pcall(noctalia.state.set, STATE_SEARCH, searchText or "")
+end
+
+-- Abre otra ventana del plugin. `panel-open` sí acepta contexto; `panel-toggle`
+-- no, y el contexto es lo que le dice al script si debe dibujar la estantería
+-- vertical o el carrusel apaisado.
+local function openLauncherPanel(panelId, context)
+  if context and #context > 0 then
+    pcall(noctalia.state.set, STATE_LAYOUT, context)
+  end
+  local cmd = "noctalia msg panel-open alexander/game-launcher:" .. panelId
+  if context and #context > 0 then cmd = cmd .. " " .. context end
+  pcall(function() noctalia.runAsync(cmd) end)
 end
 
 local steamCoverDir = ""
@@ -985,6 +1062,7 @@ addGameFromExe = function(exePath, gameName)
   table.insert(externalExtra, g)
   saveExternalExtra()
   fetchCoverByName(g)
+  pcall(noctalia.state.set, STATE_GAMES, games)
   return g
 end
 
@@ -1855,17 +1933,10 @@ local function renderOpenCase(g, meta, cp, cw, ch)
 end
 
 
-local function renderGameRow(g, index)
-  local meta = runnerMeta[g.runner] or { glyph = "app-window", color = "on_surface_variant" }
+-- Caja cerrada (cabecera de plataforma + carátula) a un tamaño dado. La usan
+-- la estantería vertical y la fila horizontal del modo jukebox.
+local function renderCaseBox(g, meta, cp, cw, ch, focused)
   local badge = gameBadge(g)
-  local launching = launchingId ~= nil
-  local isLaunching = launchingCaseId == g.id
-  local focus = focusedGame()
-  local focused = (focus ~= nil and focus.id == g.id) or isLaunching
-  local p = anim[g.id] or 0
-  local ch = math.floor(COVER_H * (1 + (COVER_GROW - 1) * p))
-  local cw = math.floor(ch * COVER_RATIO)
-  local cp = coverFor(g)
   local bannerH = math.max(12, math.floor(ch * 0.085))
   local innerW = cw - 4
   local innerH = ch - bannerH - 4
@@ -1891,6 +1962,48 @@ local function renderGameRow(g, index)
     })
   end
 
+  return ui.row({
+    width = cw,
+    height = ch,
+    gap = 0,
+    radius = 4,
+    fill = "#0b0e12",
+    border = focused and "primary" or "outline/0.55",
+    borderWidth = focused and 2 or 1,
+  }, {
+    ui.column({ flexGrow = 1, gap = 0 }, {
+      ui.row({
+        height = bannerH,
+        fill = "#0d1117",
+        align = "center",
+        justify = "center",
+        gap = 3,
+      }, {
+        badgeGlyph(badge, math.max(8, math.floor(bannerH * 0.62))),
+        ui.label({
+          text = string.upper(badge.label or ""),
+          fontSize = math.max(6, math.floor(bannerH * 0.46)),
+          color = "on_surface",
+          maxLines = 1,
+        }),
+      }),
+      art,
+    }),
+  })
+end
+
+local function renderGameRow(g, index)
+  local meta = runnerMeta[g.runner] or { glyph = "app-window", color = "on_surface_variant" }
+  local badge = gameBadge(g)
+  local launching = launchingId ~= nil
+  local isLaunching = launchingCaseId == g.id
+  local focus = focusedGame()
+  local focused = (focus ~= nil and focus.id == g.id) or isLaunching
+  local p = anim[g.id] or 0
+  local ch = math.floor(COVER_H * (1 + (COVER_GROW - 1) * p))
+  local cw = math.floor(ch * COVER_RATIO)
+  local cp = coverFor(g)
+
   -- La caja: cabecera con la plataforma y carátula, como las cajas que
   -- dibuja GameCase.qml en el repo. Al lanzar se sustituye por la caja
   -- abierta: la tapa gira, la bandeja aparece y el disco gira.
@@ -1898,34 +2011,7 @@ local function renderGameRow(g, index)
   if isLaunching then
     caseWidget = renderOpenCase(g, meta, cp, cw, ch)
   else
-    caseWidget = ui.row({
-      width = cw,
-      height = ch,
-      gap = 0,
-      radius = 4,
-      fill = "#0b0e12",
-      border = focused and "primary" or "outline/0.55",
-      borderWidth = focused and 2 or 1,
-    }, {
-      ui.column({ flexGrow = 1, gap = 0 }, {
-        ui.row({
-          height = bannerH,
-          fill = "#0d1117",
-          align = "center",
-          justify = "center",
-          gap = 3,
-        }, {
-          badgeGlyph(badge, math.max(8, math.floor(bannerH * 0.62))),
-          ui.label({
-            text = string.upper(badge.label or ""),
-            fontSize = math.max(6, math.floor(bannerH * 0.46)),
-            color = "on_surface",
-            maxLines = 1,
-          }),
-        }),
-        art,
-      }),
-    })
+    caseWidget = renderCaseBox(g, meta, cp, cw, ch, focused)
   end
 
   local variants = expandableVariants(g)
@@ -2030,6 +2116,342 @@ local function renderGameList()
   return rows
 end
 
+-- ---------------------------------------------------------------------------
+-- Vista horizontal (jukebox)
+--
+-- ui.scroll solo desplaza en vertical, así que en lugar de una fila enorme
+-- que se desplace se enseña una ventana de JUKEBOX_VISIBLE cajas alrededor de
+-- la seleccionada. Al mover la selección la ventana se recentra sola, igual
+-- que el carrusel del repo NonDot GameLibrary. Las cajas conservan su
+-- carátula, la cabecera de plataforma, el crecimiento al pasar el ratón y la
+-- apertura de disco al lanzar.
+-- ---------------------------------------------------------------------------
+
+local function jukeboxRange()
+  local n = #filtered
+  if n == 0 then return 0, 0 end
+  local visible = horizontalMode and JUKEBOX_VISIBLE_WIDE or JUKEBOX_VISIBLE
+  local first = selectedIndex + 1 - math.floor(visible / 2)
+  if first < 1 then first = 1 end
+  local last = first + visible - 1
+  if last > n then
+    last = n
+    first = math.max(1, last - visible + 1)
+  end
+  return first, last
+end
+
+local function moveJukebox(step)
+  if activeTab ~= TAB_GAMES or #filtered == 0 then return end
+  selectedIndex = selectedIndex + step
+  if selectedIndex < 0 then selectedIndex = #filtered - 1 end
+  if selectedIndex >= #filtered then selectedIndex = 0 end
+  -- Las opciones abiertas eran de otro juego y el cursor ya no está encima.
+  expandedId = nil
+  optionIndex = 0
+  hoveredId = nil
+  ensureTicks(true)
+  render()
+end
+
+local function renderJukeboxCard(g, index)
+  local meta = runnerMeta[g.runner] or { glyph = "app-window", color = "on_surface_variant" }
+  local launching = launchingId ~= nil
+  local isLaunching = launchingCaseId == g.id
+  local focus = focusedGame()
+  local focused = (focus ~= nil and focus.id == g.id) or isLaunching
+  local p = anim[g.id] or 0
+  local ch = math.floor(JUKEBOX_BASE_H * (1 + (COVER_GROW - 1) * p))
+  local cw = math.floor(ch * COVER_RATIO)
+  local cp = coverFor(g)
+  local variants = expandableVariants(g)
+
+  local caseWidget
+  if isLaunching then
+    caseWidget = renderOpenCase(g, meta, cp, cw, ch)
+  else
+    caseWidget = renderCaseBox(g, meta, cp, cw, ch, focused)
+  end
+
+  local function activate()
+    if launching then return end
+    -- En el carrusel, pulsar una caja que no está seleccionada la trae al
+    -- centro; pulsar la seleccionada la abre (o muestra sus opciones).
+    if index ~= selectedIndex then
+      selectedIndex = index
+      expandedId = nil
+      optionIndex = 0
+      hoveredId = nil
+      ensureTicks(true)
+      render()
+      return
+    end
+    if variants then
+      expandedId = g.id
+      optionIndex = 0
+      render()
+    else
+      beginLaunch(g)
+    end
+  end
+
+  return ui.column({
+    key = g.id,
+    align = "center",
+    justify = "center",
+    gap = 4,
+    paddingH = 2,
+    paddingV = 4,
+    radius = 12,
+    fill = focused and "primary/0.10" or "primary/0",
+    border = "primary/0.35",
+    borderWidth = focused and 1 or 0,
+    opacity = isLaunching and 1 or (launching and 0.25 or (focused and 1 or (1 - 0.45 * dim))),
+    onHover = "onCardHover",
+    onClick = activate,
+  }, {
+    caseWidget,
+    -- Balda de cristal, igual que en la vista vertical.
+    ui.column({ width = cw + 18, align = "center", gap = 2 }, {
+      ui.box({
+        width = cw + 10,
+        height = 3,
+        radius = 2,
+        fill = focused and "primary" or "outline/0.55",
+      }),
+      ui.box({ width = cw + 18, height = 1, fill = "outline/0.28" }),
+    }),
+    ui.label({
+      text = g.name,
+      fontSize = focused and (horizontalMode and 16 or 13) or (horizontalMode and 13 or 11),
+      fontWeight = focused and "bold" or nil,
+      color = focused and "on_surface" or "on_surface_variant",
+      maxLines = 1,
+    }),
+  })
+end
+
+local function renderJukeboxDetails(wide)
+  local g = filtered[selectedIndex + 1]
+  if not g then return ui.row() end
+  local badge = gameBadge(g)
+  local variants = expandableVariants(g)
+  local launching = launchingId ~= nil
+  local isLaunching = launchingCaseId == g.id
+
+  local info = {
+    badgeGlyph(badge, 14),
+    ui.label({ text = badge.label, fontSize = 11, color = "on_surface_variant" }),
+  }
+  if isLaunching then
+    info = {
+      ui.glyph({ name = "disc", size = 14, color = "primary" }),
+      ui.label({ text = "Abriendo…", fontSize = 12, color = "primary/0.9" }),
+    }
+  elseif variants then
+    table.insert(info, ui.label({
+      text = "· " .. (1 + #variants) .. " formas de abrir",
+      fontSize = 11,
+      color = "primary/0.9",
+    }))
+  end
+
+  local buttons = {
+    ui.button({
+      text = isLaunching and "Abriendo…" or "Jugar",
+      glyph = isLaunching and "disc" or "player-play",
+      variant = "primary",
+      onClick = function()
+        if not launching then beginLaunch(g) end
+      end,
+    }),
+  }
+  if variants then
+    table.insert(buttons, ui.button({
+      text = "Opciones",
+      glyph = "adjustments",
+      variant = "outline",
+      onClick = function()
+        expandedId = g.id
+        optionIndex = 0
+        render()
+      end,
+    }))
+  end
+
+  local children = {
+    ui.label({
+      text = g.name,
+      fontSize = wide and 26 or 20,
+      fontWeight = "bold",
+      color = "on_surface",
+      maxLines = wide and 2 or 1,
+      textAlign = wide and "start" or nil,
+    }),
+    ui.row({ align = "center", gap = 6 }, info),
+    ui.row({ align = "center", gap = 8 }, buttons),
+  }
+  if wide then
+    table.insert(children, ui.label({
+      text = string.format("%d / %d", selectedIndex + 1, #filtered),
+      fontSize = 11,
+      color = "on_surface_variant",
+    }))
+    table.insert(children, ui.label({
+      text = "Usa ← → o las flechas del mando para cambiar de juego.",
+      fontSize = 11,
+      color = "on_surface_variant/0.8",
+      maxLines = 2,
+    }))
+  end
+  table.insert(children, (expandedId == g.id and renderLaunchOptions()) or ui.row())
+
+  return ui.column({
+    align = wide and "start" or "center",
+    justify = wide and "center" or nil,
+    gap = wide and 10 or 6,
+    flexGrow = wide and 1 or nil,
+  }, children)
+end
+
+-- La fila de cajas con sus flechas. Se usa tal cual en la ventana vertical y
+-- dentro del carrusel apaisado.
+local function renderJukeboxStrip()
+  local first, last = jukeboxRange()
+  local cards = {}
+  for i = first, last do
+    table.insert(cards, renderJukeboxCard(filtered[i], i - 1))
+  end
+
+  return ui.row({
+    align = "center",
+    justify = "center",
+    gap = 8,
+    flexGrow = 1,
+    minWidth = 0,
+    paddingH = horizontalMode and 14 or 0,
+  }, {
+    ui.button({
+      glyph = "arrow-left",
+      variant = "ghost",
+      controlSize = "sm",
+      tooltip = "Anterior",
+      onClick = function() moveJukebox(-1) end,
+    }),
+    ui.row({ align = "center", justify = "center", gap = 10, flexGrow = 1, minWidth = 0 }, cards),
+    ui.button({
+      glyph = "arrow-right",
+      variant = "ghost",
+      controlSize = "sm",
+      tooltip = "Siguiente",
+      onClick = function() moveJukebox(1) end,
+    }),
+  })
+end
+
+local function renderJukebox()
+  local stripH = math.floor(JUKEBOX_BASE_H * COVER_GROW) + 66
+  return ui.column({ flexGrow = 1, gap = 8 }, {
+    ui.column({
+      height = stripH,
+      flexGrow = 0,
+      justify = "center",
+      padding = 10,
+      fill = "surface_variant/0.28",
+      radius = 18,
+      border = "outline/0.45",
+      borderWidth = 1,
+    }, { renderJukeboxStrip() }),
+    renderJukeboxDetails(false),
+  })
+end
+
+-- Rueda en el carrusel apaisado: el ui.scroll entrega (offset, maxOffset).
+-- Traducimos el cambio de offset a mover la selección y anclamos el espaciador
+-- al offset para que las cajas no se desplacen visualmente.
+local function onJukeboxScroll(offset, _maxOffset)
+  local off = math.floor(tonumber(offset) or 0)
+  local ok, nowRaw = pcall(noctalia.nowMs)
+  local now = ok and tonumber(nowRaw) or 0
+  if now < jbIgnoreUntil then
+    -- Reveal/colocación inicial: sincroniza sin cambiar de juego.
+    jbInit = true
+    jbLastOffset = off
+    jbGuideTop = off
+    return
+  end
+  if not jbInit then
+    jbInit = true
+    jbLastOffset = off
+    jbGuideTop = off
+    return
+  end
+  local delta = off - jbLastOffset
+  if delta == 0 then return end
+  jbLastOffset = off
+  jbGuideTop = off
+  jbScrollAccum = jbScrollAccum + delta
+  local step = 24
+  while math.abs(jbScrollAccum) >= step do
+    if jbScrollAccum > 0 then
+      moveJukebox(1)
+      jbScrollAccum = jbScrollAccum - step
+    else
+      moveJukebox(-1)
+      jbScrollAccum = jbScrollAccum + step
+    end
+  end
+end
+
+-- Ventana apaisada: los datos del juego a la izquierda y el carrusel al lado,
+-- no debajo. La ventana entera es horizontal (1240x640), así que la fila de
+-- cajas respira y desaparece el hueco negro que dejaba la vista vertical.
+-- El carrusel va dentro de un ui.scroll (espaciador guía) para que la rueda
+-- del ratón funcione igual que las flechas aunque el panel no entregue el
+-- hook global onScroll.
+local function renderJukeboxWide()
+  local reveal = jbReveal
+  jbReveal = nil
+  return ui.row({ flexGrow = 1, gap = 14, align = "stretch" }, {
+    ui.column({ width = 260, gap = 10, justify = "center" }, {
+      renderSearchBar(),
+      renderJukeboxDetails(true),
+    }),
+    ui.column({
+      flexGrow = 1,
+      minWidth = 0,
+      paddingV = 10,
+      paddingH = 18,
+      fill = "surface_variant/0.28",
+      radius = 18,
+      border = "outline/0.45",
+      borderWidth = 1,
+      align = "stretch",
+    }, {
+      ui.scroll({
+        key = "jb-scroll",
+        flexGrow = 1,
+        fill = "surface_variant/0.28",
+        radius = 18,
+        revealKey = reveal,
+        onScroll = function(offset, maxOffset) onJukeboxScroll(offset, maxOffset) end,
+      }, {
+        ui.column({ gap = 0, flexGrow = 1 }, {
+          -- El ancla debe ser diminuta: revealKey la lleva al borde superior
+          -- del viewport y así el carrusel queda siempre a la misma altura.
+          ui.box({ height = math.max(0, jbGuideTop - 1) }),
+          ui.box({ key = "jb-anchor", height = 1 }),
+          ui.box({ height = JB_WIDE_TOP_GAP }),
+          ui.column({ justify = "center", flexGrow = 1, minHeight = 1, minWidth = 0 }, {
+            renderJukeboxStrip(),
+          }),
+          ui.box({ height = JUKEBOX_GUIDE }),
+        }),
+      }),
+    }),
+  })
+end
+
 local function renderBody(content)
   if loading then
     return ui.label({ text = "Scanning for games…", color = "on_surface_variant" })
@@ -2091,6 +2513,24 @@ function cycleTab(step)
   switchTab(TAB_ORDER[idx])
 end
 
+-- No cambia la vista dentro de la misma ventana: cierra ésta y abre la otra
+-- entrada del plugin. La vertical es alta y estrecha; la horizontal es
+-- apaisada, que es lo que necesita el carrusel. El contexto "vertical"/
+-- "jukebox" viaja en el panel-open y lo lee onOpen.
+local function toggleViewMode()
+  rememberSelection()
+  hoveredId = nil
+  expandedId = nil
+  optionIndex = 0
+  if horizontalMode then
+    openLauncherPanel("original", "vertical")
+  else
+    openLauncherPanel("horizontal", "jukebox")
+  end
+  -- Cierra esta ventana; la otra se abre por IPC y mantiene el juego/búsqueda.
+  panel.close()
+end
+
 local function renderTabs()
   local function tab(id, label, glyphName)
     return ui.button({
@@ -2134,10 +2574,47 @@ local function renderTabs()
     for _, item in ipairs(shortcuts) do table.insert(items, item) end
   end
   table.insert(items, ui.spacer({ flexGrow = 1 }))
+  -- Alterna entre la estantería vertical y la fila horizontal (jukebox).
+  if activeTab == TAB_GAMES then
+    table.insert(items, ui.button({
+      key = "view_toggle",
+      text = viewMode == "shelf" and "Horizontal" or "Vertical",
+      glyph = viewMode == "shelf" and "arrows-horizontal" or "arrows-vertical",
+      variant = "ghost",
+      controlSize = "sm",
+      tooltip = viewMode == "shelf" and "Cambiar a vista horizontal" or "Cambiar a vista vertical",
+      onClick = function() toggleViewMode() end,
+    }))
+  end
   -- Donde antes estaba el contador: añadir un .exe desde el disco. Al
   -- elegirlo se suma a la vitrina y se abre con Faugus.
   table.insert(items, tab(TAB_ADD, "Añadir juego", "plus"))
-  return ui.row({ align = "center", gap = 6 }, items)
+  -- flexGrow deja que la fila de pestañas ocupe el hueco de la cabecera
+  -- apaisada, donde comparte renglón con el título y los botones.
+  return ui.row({ align = "center", gap = 6, flexGrow = 1 }, items)
+end
+
+-- Cabecera de la ventana apaisada: título, pestañas, atajos y controles en
+-- un solo renglón. La vertical sigue usando renderHeader + renderTabs.
+local function renderHorizontalHeader()
+  return ui.row({ align = "center", gap = 8 }, {
+    ui.glyph({ name = "device-gamepad-2", size = 20, color = "primary" }),
+    ui.label({
+      text = "Game Launcher",
+      fontSize = 18,
+      fontWeight = "bold",
+      color = "primary",
+    }),
+    ui.label({
+      text = "(" .. #filtered .. " games)",
+      color = "on_surface_variant",
+      fontSize = 12,
+    }),
+    ui.separator({ orientation = "vertical", thickness = 1, color = "outline/0.4" }),
+    renderTabs(),
+    ui.button({ glyph = "reload", variant = "ghost", onClick = "onRescan" }),
+    ui.button({ glyph = "close", variant = "ghost", onClick = "onClose" }),
+  })
 end
 
 local function renderBrowseHeader()
@@ -2330,38 +2807,46 @@ render = function()
         })
       end
     else
-      body = renderBody(renderGameList())
-      if loading or errorMsg ~= "" or #filtered == 0 then
-        bodyWidget = ui.column({ flexGrow = 1, gap = 6 }, body)
+      -- La ventana apaisada usa cajas más grandes que la vertical.
+      JUKEBOX_BASE_H = horizontalMode and JUKEBOX_WIDE_BASE_H or 175
+      local showJukebox = (horizontalMode or viewMode == "jukebox")
+        and not loading and errorMsg == "" and #filtered > 0
+      if showJukebox then
+        bodyWidget = horizontalMode and renderJukeboxWide() or renderJukebox()
       else
-        -- The wheel scrolls this container natively. onScroll maps the
-        -- resulting offset back onto the selection, so the highlighted row
-        -- follows the view and Return launches whatever is in front.
-        bodyWidget = ui.scroll({
-          key = "gl-games-scroll",
-          flexGrow = 1,
-          gap = 6,
-          padding = 10,
-          fill = "surface_variant/0.28",
-          radius = 18,
-          border = "outline/0.45",
-          borderWidth = 1,
-          revealKey = revealKey,
-          onScroll = function(offset, _maxOffset)
-            local idx = math.floor((tonumber(offset) or 0) / ROW_H)
-            if idx < 0 then idx = 0 end
-            if idx > #filtered - 1 then idx = #filtered - 1 end
-            if idx ~= selectedIndex then
-              selectedIndex = idx
-              -- La rueda cambia de juego: las opciones abiertas eran de otro.
-              if expandedId then
-                expandedId = nil
-                optionIndex = 0
+        body = renderBody(renderGameList())
+        if loading or errorMsg ~= "" or #filtered == 0 then
+          bodyWidget = ui.column({ flexGrow = 1, gap = 6 }, body)
+        else
+          -- The wheel scrolls this container natively. onScroll maps the
+          -- resulting offset back onto the selection, so the highlighted row
+          -- follows the view and Return launches whatever is in front.
+          bodyWidget = ui.scroll({
+            key = "gl-games-scroll",
+            flexGrow = 1,
+            gap = 6,
+            padding = 10,
+            fill = "surface_variant/0.28",
+            radius = 18,
+            border = "outline/0.45",
+            borderWidth = 1,
+            revealKey = revealKey,
+            onScroll = function(offset, _maxOffset)
+              local idx = math.floor((tonumber(offset) or 0) / ROW_H)
+              if idx < 0 then idx = 0 end
+              if idx > #filtered - 1 then idx = #filtered - 1 end
+              if idx ~= selectedIndex then
+                selectedIndex = idx
+                -- La rueda cambia de juego: las opciones abiertas eran de otro.
+                if expandedId then
+                  expandedId = nil
+                  optionIndex = 0
+                end
+                render()
               end
-              render()
-            end
-          end,
-        }, body)
+            end,
+          }, body)
+        end
       end
     end
     -- Las opciones de lanzamiento se pintan dentro de la fila del juego que
@@ -2371,8 +2856,18 @@ render = function()
     -- En el paso del nombre no hay nada que buscar: la barra desaparece para
     -- que el campo de texto sea el único foco.
     local showSearch = not (activeTab == TAB_ADD and addExePath)
-    local head = { renderHeader(), renderTabs() }
-    if showSearch then table.insert(head, renderSearchBar()) end
+    local head
+    if horizontalMode then
+      -- Todo en un renglón; en Juegos la búsqueda vive en la columna
+      -- izquierda, junto a los datos del juego.
+      head = { renderHorizontalHeader() }
+      if showSearch and activeTab ~= TAB_GAMES then
+        table.insert(head, renderSearchBar())
+      end
+    else
+      head = { renderHeader(), renderTabs() }
+      if showSearch then table.insert(head, renderSearchBar()) end
+    end
     local rootChildren = {
       ui.column({ gap = 8 }, head),
       bodyWidget,
@@ -2567,6 +3062,7 @@ function scanGames()
           pcall(appendDesktopGames)
           pcall(appendExternalGames)
           pcall(noctalia.state.set, "games", games)
+          pcall(noctalia.state.set, STATE_GAMES, games)
           fetchMissingCovers()
         else
           errorMsg = "Failed to parse game list: " .. (err2 or "unknown error")
@@ -2602,7 +3098,22 @@ end
 
 
 function onOpen(context)
+  -- `noctalia msg panel-open ... jukebox` trae el contexto; el atajo Mod+Z
+  -- abre la entrada "original" sin contexto y por tanto en vertical.
+  local layout = context
+  if type(layout) ~= "string" or #layout == 0 then
+    local savedLayout = noctalia.state.get(STATE_LAYOUT)
+    if type(savedLayout) == "string" then layout = savedLayout end
+  end
+  pcall(noctalia.state.set, STATE_LAYOUT, "")
+  horizontalMode = (layout == "jukebox" or layout == "horizontal")
+  viewMode = horizontalMode and "jukebox" or "shelf"
   noctalia.state.set("o_open", true)
+
+  -- Continuidad al cambiar de ventana: mismo juego y misma búsqueda.
+  local savedSearch = noctalia.state.get(STATE_SEARCH)
+  if type(savedSearch) == "string" then searchText = savedSearch end
+
   selectedIndex = 0
   hoveredId = nil
   dim = 0
@@ -2611,7 +3122,31 @@ function onOpen(context)
   launchElapsed = 0
   launchLid = 0
   launchRenderAcc = 0
+  resetJukeboxScroll()
+
+  -- Si la otra ventana ya escaneó la biblioteca, se reutiliza al instante;
+  -- solo se vuelve a escanear cuando no hay nada cacheado.
+  local cached = noctalia.state.get(STATE_GAMES)
   filterGames(searchText)
+  if type(cached) == "table" and #cached > 0 then
+    games = cached
+    coverExists = {}
+    filterGames(searchText)
+    local wanted = noctalia.state.get(STATE_SELECTED)
+    if type(wanted) == "string" and #wanted > 0 then
+      for i, g in ipairs(filtered) do
+        if g.id == wanted then
+          selectedIndex = i - 1
+          break
+        end
+      end
+    end
+    clampSelection()
+    render()
+    ensureTicks(true)
+    return
+  end
+
   render()
   ensureTicks(true)
   scanGames()
@@ -2620,6 +3155,8 @@ end
 function onClose()
   -- Cerrar el panel cancela un lanzamiento en curso: el juego solo arranca
   -- al terminar la animación de apertura.
+  rememberSelection()
+  pcall(function() noctalia.state.set("o_open", false) end)
   launchingId = nil
   launchingCaseId = nil
   launchElapsed = 0
@@ -2697,6 +3234,24 @@ function onIpc(event, payload)
     else
       switchTab(TAB_GAMES)
     end
+  elseif event == "view" then
+    local v = tostring(arg):match("^%s*(.-)%s*$")
+    if v == "jukebox" and not horizontalMode then
+      rememberSelection()
+      openLauncherPanel("horizontal", "jukebox")
+    elseif v == "shelf" and horizontalMode then
+      rememberSelection()
+      openLauncherPanel("original", "vertical")
+    elseif v == "shelf" or v == "jukebox" then
+      viewMode = v
+      hoveredId = nil
+      expandedId = nil
+      optionIndex = 0
+      ensureTicks(true)
+      render()
+    else
+      toggleViewMode()
+    end
   elseif event == "add" then
     -- CLI: añade el .exe indicado y lo abre con Faugus. Admite
     -- "/ruta/juego.exe|Nombre del juego" para fijar el nombre de la portada.
@@ -2729,6 +3284,7 @@ function onIpc(event, payload)
       end
     end
     saveExternalExtra()
+    pcall(noctalia.state.set, STATE_GAMES, games)
     filterGames(searchText)
     render()
   elseif event == "dir" then
@@ -2740,10 +3296,12 @@ function onIpc(event, payload)
   elseif event == "search" then
     onSearch(arg)
   elseif event == "status" then
+    local jbFirst, jbLast = jukeboxRange()
     noctalia.log(string.format(
-      "game-launcher status: tab=%s path=[%s] disks=%s entradas=%d visibles=%d browseSel=%d gameSel=%d err=[%s] juegos=%d filtrados=%d",
-      activeTab, browsePath, tostring(browseDisks), #browseEntries, #browseFiltered,
-      browseIndex, selectedIndex, browseError, #games, #filtered))
+      "game-launcher status: vista=%s horiz=%s tab=%s path=[%s] disks=%s entradas=%d visibles=%d browseSel=%d gameSel=%d err=[%s] juegos=%d filtrados=%d jbBase=%d jbVis=%d jbRango=%d-%d",
+      viewMode, tostring(horizontalMode), activeTab, browsePath, tostring(browseDisks), #browseEntries, #browseFiltered,
+      browseIndex, selectedIndex, browseError, #games, #filtered,
+      JUKEBOX_BASE_H, horizontalMode and JUKEBOX_VISIBLE_WIDE or JUKEBOX_VISIBLE, jbFirst, jbLast))
   elseif event == "names" then
     -- Diagnóstico: lista los juegos realmente visibles (nombre[y runner])
     local out = {}
@@ -2900,6 +3458,21 @@ function onKey(chord, pressed)
     return
   end
 
+  -- En la fila horizontal las cuatro flechas mueven el carrusel: la ventana
+  -- se recentra en la caja seleccionada. Return abre el juego del centro.
+  if viewMode == "jukebox" then
+    if chord == "Left" or chord == "Up" then
+      moveJukebox(-1)
+    elseif chord == "Right" or chord == "Down" then
+      moveJukebox(1)
+    elseif chord == "Return" then
+      if #filtered > 0 and selectedIndex >= 0 and selectedIndex < #filtered then
+        beginLaunch(filtered[selectedIndex + 1])
+      end
+    end
+    return
+  end
+
   if chord == "Up" then
     if #filtered > 0 then
       selectedIndex = selectedIndex - 1
@@ -2924,5 +3497,29 @@ function onKey(chord, pressed)
     elseif #filtered > 0 and selectedIndex >= 0 and selectedIndex < #filtered then
       beginLaunch(filtered[selectedIndex + 1])
     end
+  end
+end
+
+-- Rueda del ratón en la vista horizontal. Los paneles sí reciben onScroll,
+-- así que cada paso mueve el carrusel como las flechas. En la estantería
+-- vertical la rueda la gestiona el propio ui.scroll y este hook no hace nada.
+-- En la ventana apaisada la vista es siempre jukebox.
+local lastScrollTime = 0
+function onScroll(axis, steps, _startsGesture)
+  pcall(function()
+    noctalia.log("game-launcher scroll: axis=" .. tostring(axis) .. " steps=" .. tostring(steps)
+      .. " tab=" .. tostring(activeTab) .. " view=" .. tostring(viewMode) .. " horiz=" .. tostring(horizontalMode))
+  end)
+  if activeTab ~= TAB_GAMES then return end
+  if not (viewMode == "jukebox" or horizontalMode) then return end
+  if #filtered == 0 then return end
+  local now = os.clock()
+  if now - lastScrollTime < 0.06 then return end
+  lastScrollTime = now
+  local n = tonumber(steps) or 0
+  if n > 0 then
+    moveJukebox(1)
+  elseif n < 0 then
+    moveJukebox(-1)
   end
 end

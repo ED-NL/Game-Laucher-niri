@@ -79,7 +79,21 @@ height = "fill"
 placement = "floating"
 position = "center"
 open_near_click = false
-capture_keys = ["Up", "Down", "Left", "Return"]
+capture_keys = ["Up", "Down", "Left", "Right", "Return"]
+
+# Misma entrada que "original", pero en una ventana apaisada. La vista
+# horizontal (jukebox) necesita ancho para enseñar varias cajas y los datos
+# del juego al lado; en la ventana vertical de 780 px todo quedaba apilado y
+# con mucho espacio vacío debajo.
+[[panel]]
+id = "horizontal"
+entry = "original.luau"
+width = 1240
+height = 640
+placement = "floating"
+position = "center"
+open_near_click = false
+capture_keys = ["Up", "Down", "Left", "Right", "Return"]
 
 [[launcher_provider]]
 id = "search"

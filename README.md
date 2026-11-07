@@ -100,6 +100,12 @@ Si cambia el punto de montaje, hay que actualizar `GAME_DIR` en los `launch.sh` 
 - Cabecera con logo de PlayStation + **PS4** solo en esos dos juegos.
 - Lanzamiento mediante `desktop://` + `gio launch`.
 - Ajuste `desktop_enabled` para mostrar/ocultar los juegos del menú de aplicaciones.
+- **Vista horizontal**: el panel `alexander/game-launcher:horizontal` usa una
+  ventana apaisada (1240x640, entrada `original.luau` compartida) con los datos
+  del juego a la izquierda y el carrusel de cajas a la derecha. Se abre con el
+  botón **Horizontal** de la vista vertical o con
+  `noctalia msg panel-open alexander/game-launcher:horizontal jukebox`. La
+  rueda del ratón y `←/→` mueven el carrusel; `Vertical` vuelve a la estantería.
 
 ## Notas
 
