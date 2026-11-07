@@ -2391,7 +2391,8 @@ local function onJukeboxScroll(offset, _maxOffset)
   jbLastOffset = off
   jbGuideTop = off
   jbScrollAccum = jbScrollAccum + delta
-  local step = 24
+  -- Un paso de rueda típico son ~50 px; así una muesca mueve un juego.
+  local step = 50
   while math.abs(jbScrollAccum) >= step do
     if jbScrollAccum > 0 then
       moveJukebox(1)

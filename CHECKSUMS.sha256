@@ -605,7 +605,7 @@ ee427a6adf04be8c0cb193ddb15e1c5f67f22e6e984177ae055402941ca32443  ./launchers/In
 81f1aae0a3a979780bdb1f50c1e69900677df2516768cf4c4548632a183abc79  ./niri/keybind-game-launcher.txt
 3b6fcbe9169625737e2bd352b32e142797e7434e59525ce8d3d7f7b447786c89  ./patches/game-launcher/README.md
 890f33d7e22f742765ba96b006d264e32e8a38733240e93ff22fb8ec734d287b  ./patches/game-launcher/gamelauncher.c
-22558e40f85573d97f493ae060c4d40fadffde51763aaef7259c4c520561c485  ./patches/game-launcher/original.luau
+922124f6d451f6cbb967bc97cfe582ec7d9b4335cf59a585cc6914f59b82f6bb  ./patches/game-launcher/original.luau
 37b9e831e2747c45aae0d5c1af75ded558c304f9d082b4bd02f9751e6f25bbb0  ./patches/game-launcher/panel.luau
 3c74dd112e243182301b196151bb06973c8a0bb12f01e752da9ead75660bb905  ./patches/game-launcher/plugin.toml
 a29a415d32a83143c2b85461091e1e0e6c636572e0447442cad32bcce7477755  ./patches/game-launcher/search.luau
@@ -619,7 +619,7 @@ f03c867e3f693b17fbcaac0faa7b04bb3f93232d5a6783cee166feae7db00d38  ./plugin/.giti
 3b6fcbe9169625737e2bd352b32e142797e7434e59525ce8d3d7f7b447786c89  ./plugin/README.md
 ce54c8e774b0d99193e860b95609738781e4d483295c2ffd5bddf13744935690  ./plugin/gamelauncher
 890f33d7e22f742765ba96b006d264e32e8a38733240e93ff22fb8ec734d287b  ./plugin/gamelauncher.c
-22558e40f85573d97f493ae060c4d40fadffde51763aaef7259c4c520561c485  ./plugin/original.luau
+922124f6d451f6cbb967bc97cfe582ec7d9b4335cf59a585cc6914f59b82f6bb  ./plugin/original.luau
 37b9e831e2747c45aae0d5c1af75ded558c304f9d082b4bd02f9751e6f25bbb0  ./plugin/panel.luau
 3c74dd112e243182301b196151bb06973c8a0bb12f01e752da9ead75660bb905  ./plugin/plugin.toml
 a29a415d32a83143c2b85461091e1e0e6c636572e0447442cad32bcce7477755  ./plugin/search.luau
