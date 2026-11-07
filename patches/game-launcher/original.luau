@@ -53,8 +53,9 @@ local viewMode = "shelf"
 local horizontalMode = false
 local JUKEBOX_VISIBLE = 4
 local JUKEBOX_BASE_H = 175
--- La ventana apaisada puede permitirse cajas más grandes.
-local JUKEBOX_WIDE_BASE_H = 210
+-- La ventana apaisada puede permitirse cajas más grandes: así el carrusel
+-- llena la ventana y no queda una franja negra encima y debajo.
+local JUKEBOX_WIDE_BASE_H = 330
 -- En apaisado caben menos con holgura; se ajusta al abrir según el modo.
 local JUKEBOX_VISIBLE_WIDE = 3
 -- Clave de estado para que al cambiar de ventana el juego seleccionado y la
@@ -76,7 +77,7 @@ local STATE_LAYOUT = "gl_layout"
 -- el panel podía quedarse en negro mostrando sólo el espaciador.
 local JB_REST_OFFSET = 650
 -- Hueco entre el espaciador y la fila para que el carrusel quede centrado.
-local JB_WIDE_TOP_GAP = 90
+local JB_WIDE_TOP_GAP = 14
 local JB_STRIP_KEY = "jb-strip"
 local jbGuideTop = JB_REST_OFFSET
 local jbLastOffset = JB_REST_OFFSET
@@ -2429,7 +2430,10 @@ local function renderJukeboxWide()
   -- No se consume: el host lo reaplica cuando el hijo aparece, y así el panel
   -- no se queda en negro si el primer render no tenía aún la fila de cajas.
   local reveal = jbReveal
-  return ui.row({ flexGrow = 1, gap = 14, align = "stretch" }, {
+  -- Alto de la fila de cajas (caja + balda + nombre) y del contenedor que la
+  -- recorta: así no quedan franjas negras arriba/abajo.
+  local stripH = math.floor(JUKEBOX_BASE_H * COVER_GROW) + 66
+  return ui.row({ flexGrow = 1, gap = 14, align = "center" }, {
     ui.column({ width = 260, gap = 10, justify = "center" }, {
       renderSearchBar(),
       renderJukeboxDetails(true),
@@ -2437,6 +2441,7 @@ local function renderJukeboxWide()
     ui.column({
       flexGrow = 1,
       minWidth = 0,
+      height = stripH + 50,
       paddingV = 10,
       paddingH = 18,
       fill = "surface_variant/0.28",
