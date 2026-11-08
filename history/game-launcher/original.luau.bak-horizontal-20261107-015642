@@ -1,0 +1,3258 @@
+local games = {}
+local filtered = {}
+local searchText = ""
+local loading = false
+local errorMsg = ""
+local scanCounter = 0
+local building = false
+local initOk = true
+local selectedIndex = 0
+-- Estantería animada (estilo NonDot GameLibrary): qué caja tiene el cursor y
+-- cuánto ha crecido cada una (0..1). La UI declarativa no trae animaciones,
+-- así que el crecimiento y el atenuado se interpolan en onFrameTick.
+local hoveredId = nil
+local anim = {}
+local dim = 0
+local ticking = false
+-- Caché de carátulas existentes: fileExists por fila y por fotograma de la
+-- animación agotaba el presupuesto de CPU de 25 ms del callback.
+local coverExists = {}
+-- Game whose launch options are showing. A title can be opened in more than
+-- one way - the usual entry plus a variant such as "Stellar Blade
+-- (gamescope)" - and clicking it reveals them. The options render outside
+-- the scrolling list so the row pitch, and with it the wheel's
+-- offset-to-index maths, stays constant.
+local expandedId = nil
+-- Opción enfocada dentro de esas opciones (0 = el runner propio del juego).
+local optionIndex = 0
+-- Load marker: one line per compile, so the log tells you whether the
+-- running script is the patched one or a fresh upstream export. The table
+-- address makes every message unique (identical lines get de-duplicated).
+pcall(function()
+  noctalia.log("game-launcher: script parcheado cargado (rueda + Examinar + Discos + escritorio + navfix) vm="
+    .. (tostring({}):match("0x%x+") or "?"))
+end)
+-- The game list is rendered whole inside a ui.scroll container, so the
+-- mouse wheel scrolls it natively. A panel never receives the onScroll
+-- entry point (bar widgets only), so the selection is driven from the
+-- container's own onScroll(offset, maxOffset) prop instead.
+-- ROW_H is the fixed row height (cover stand + 6px padding top and bottom)
+-- plus the 6px gap between rows. The covers grow on hover, but the row pitch
+-- never changes, so the wheel's offset-to-index maths stays exact.
+local ROW_H = 226
+
+-- Vista del panel: "shelf" es la estantería vertical de siempre y "jukebox"
+-- la fila horizontal estilo NonDot GameLibrary. La ventana horizontal enseña
+-- solo unas cuantas cajas alrededor de la seleccionada porque ui.scroll es
+-- vertical: no hay scroll horizontal nativo.
+local viewMode = "shelf"
+local JUKEBOX_VISIBLE = 4
+local JUKEBOX_BASE_H = 175
+-- Rueda del ratón en la vista horizontal. ui.scroll es vertical, así que el
+-- carrusel vive dentro de uno con un espaciador guía: cada paso de rueda
+-- cambia la selección y el espaciador se ajusta al offset para que las cajas
+-- no se muevan de sitio. JUKEBOX_GUIDE deja margen para girar en ambos
+-- sentidos antes de recentrar.
+local JUKEBOX_GUIDE = 1600
+local JUKEBOX_SCROLL_STEP = 24
+local jukeboxGuideTop = JUKEBOX_GUIDE
+local jukeboxReveal = nil
+local jukeboxScrollOffset = nil
+local jukeboxScrollAccum = 0
+local jukeboxRecentering = false
+
+local function resetJukeboxScroll()
+  jukeboxGuideTop = JUKEBOX_GUIDE
+  jukeboxReveal = "jb-strip"
+  jukeboxScrollOffset = nil
+  jukeboxScrollAccum = 0
+  jukeboxRecentering = false
+end
+
+-- Forward-declared: the browse helpers below need to repaint before render()
+-- is defined further down, and they call each other before their own bodies.
+local render
+local loadBrowseDir
+local loadBrowseDisks
+local ensureTicks
+local beginLaunch
+local launchExeWithFaugus
+local switchTab
+local addGameFromExe
+local nameForAdd
+-- Se rellena más abajo: la búsqueda de portada (aquí arriba) tiene que poder
+-- dejar listo el disco en cuanto la portada termina de bajar.
+local prepareDisc
+
+-- Examinar: a file browser that runs a picked .exe through umu-run, the same
+-- engine Faugus drives. Nothing is written to Faugus' library, because Faugus
+-- itself can only launch a game it already knows (its --game flag looks the
+-- id up in games.json and silently returns when there is no match).
+local TAB_GAMES, TAB_BROWSE, TAB_ADD = "games", "browse", "add"
+local PAGE_STEP = 6 -- filas que saltan L1/R1 (o LT/RT) del mando
+local activeTab = TAB_GAMES
+-- Fixed row height, same trick the game list uses to turn a scroll offset
+-- back into a selection index.
+local BROWSE_ROW_H = 44
+local browsePath = ""
+local browseEntries = {}
+local browseFiltered = {}
+local browseIndex = 0
+local browseLoading = false
+local browseError = ""
+local browseScanToken = 0
+-- True while the list shows mounted disks instead of a folder.
+local browseDisks = false
+-- Paso de nombre de la pestaña "Añadir juego": .exe elegido y nombre escrito
+-- por el usuario (se usa también para buscar la portada).
+local addExePath = nil
+local addName = ""
+
+local function clampSelection()
+  if #filtered == 0 then
+    selectedIndex = 0
+    return
+  end
+  if selectedIndex < 0 then selectedIndex = 0 end
+  if selectedIndex > #filtered - 1 then selectedIndex = #filtered - 1 end
+end
+
+-- Kept under its old name so the onKey handlers stay unchanged.
+local function ensureSelVisible()
+  clampSelection()
+end
+
+-- La lista vive dentro de un ui.scroll, así que mover selectedIndex no
+-- desplaza nada por sí solo: hay que decirle al host qué fila debe quedar a
+-- la vista. revealKey se consume en el siguiente render (la rueda mueve el
+-- scroll por su cuenta y no pasa por aquí).
+local revealKey = nil
+
+local function revealSelected()
+  local g = filtered[selectedIndex + 1]
+  revealKey = g and g.id or nil
+end
+
+local function revealBrowse()
+  if #browseFiltered == 0 then
+    revealKey = nil
+  else
+    revealKey = "browse_" .. browseIndex
+  end
+end
+
+local steamCoverDir = ""
+local heroicCoverDir = ""
+-- Fotogramas pre-rotados del disco que gira al abrir la caja. La UI
+-- declarativa no tiene rotación, así que el giro se sirve como imágenes.
+local discCacheDir = ""
+local ok1, err1 = pcall(function()
+  local xdgCache = noctalia.getenv("XDG_CACHE_HOME")
+  local home = noctalia.getenv("HOME")
+  local cacheBase
+  if xdgCache and #xdgCache > 0 then
+    cacheBase = xdgCache .. "/gamelauncher"
+  elseif home and #home > 0 then
+    cacheBase = home .. "/.cache/gamelauncher"
+  else
+    cacheBase = "/tmp/gamelauncher"
+  end
+  steamCoverDir = cacheBase .. "/steam"
+  heroicCoverDir = cacheBase .. "/heroic"
+  discCacheDir = cacheBase .. "/disc"
+  local ok, err = noctalia.mkdirAll(steamCoverDir)
+  if not ok then noctalia.log("failed to create steam cover dir: " .. (err or "unknown")) end
+  ok, err = noctalia.mkdirAll(heroicCoverDir)
+  if not ok then noctalia.log("failed to create heroic cover dir: " .. (err or "unknown")) end
+  ok, err = noctalia.mkdirAll(discCacheDir)
+  if not ok then noctalia.log("failed to create disc dir: " .. (err or "unknown")) end
+end)
+if not ok1 then
+  initOk = false
+  noctalia.log("init error: " .. tostring(err1))
+end
+
+local binary = noctalia.pluginDir() .. "/gamelauncher"
+local cSource = noctalia.pluginDir() .. "/gamelauncher.c"
+local cReaderSource = noctalia.pluginDir() .. "/sqlite_reader.c"
+
+local function buildCommand()
+  return "cc -o " .. binary .. " " .. cSource .. " " .. cReaderSource
+end
+
+local buildTagFile
+do
+  local ok, dir = pcall(noctalia.pluginDataDir)
+  if ok and dir then buildTagFile = dir .. "/build_command" end
+end
+
+local function binaryReady()
+  if not noctalia.fileExists(binary) then return false end
+  if not buildTagFile then return true end
+  if noctalia.readFile(buildTagFile) ~= buildCommand() then
+    noctalia.removeFile(binary)
+    return false
+  end
+  return true
+end
+
+local function markBuilt()
+  if buildTagFile then noctalia.writeFile(buildTagFile, buildCommand()) end
+end
+
+-- Quoting for paths that get pasted into a shell command.
+local function shellQuote(s)
+  return '"' .. tostring(s):gsub('[\\$"`]', '\\%0') .. '"'
+end
+
+local function homeDir()
+  local h = noctalia.getenv("HOME")
+  if h and #h > 0 then return h end
+  return "/home/" .. (noctalia.getenv("USER") or "user")
+end
+
+local function isValidProtocol(cmd)
+  -- desktop:// carries an absolute path to a .desktop entry, which is how
+  -- games living only in the application menu are launched.
+  local protocols = { "steam://", "lutris:", "heroic://", "desktop://" }
+  for _, p in ipairs(protocols) do
+    if cmd:sub(1, #p) == p then
+      local rest = cmd:sub(#p + 1)
+      if rest:match("^[%w_%-%.%/]+$") then return true end
+    end
+  end
+  return false
+end
+
+local function isRunnerEnabled(runner)
+  -- val == nil means the key is not registered (manifest not picked up
+  -- yet, or an older export). Treat it as enabled rather than hiding
+  -- every game of that runner; a registered key still wins either way.
+  local ok, val = pcall(noctalia.getConfig, runner .. "_enabled")
+  if not ok then return true end
+  if val == nil then return true end
+  return val == true or val == "true"
+end
+
+local function filterByRunner(g)
+  return isRunnerEnabled(g.runner)
+end
+
+local function launchGame(id)
+  -- Se busca en la biblioteca completa y no en la lista visible: una
+  -- variante plegada (Stellar Blade (gamescope)) no está en filtered, pero
+  -- es una de las opciones que la barra ofrece para su base.
+  for _, g in ipairs(games) do
+    if g.id == id and g.run_command and #g.run_command > 0 and isValidProtocol(g.run_command) then
+      if g.run_command:sub(1, 10) == "desktop://" then
+        -- gio runs the entry's own Exec line, field codes and all.
+        noctalia.runAsync("gio launch " .. shellQuote(g.run_command:sub(11)))
+      else
+        noctalia.runAsync('xdg-open "' .. g.run_command .. '"')
+      end
+      onClose()
+      return
+    end
+    -- Juego local que vive en un disco: se abre con la aplicación de Faugus.
+    if g.id == id and g.runner == "external" and g.exe and #g.exe > 0 then
+      launchExeWithFaugus(g.exe, g.name)
+      return
+    end
+  end
+end
+
+--------------------------------------------------------------------------
+-- Examinar: buscar un .exe en el disco y arrancarlo con umu-run
+--
+-- Faugus itself cannot launch a file that is not in its library: --game
+-- looks the id up in games.json and silently returns when it is absent,
+-- and --shortcut only opens a window. umu-run is the engine Faugus runs
+-- underneath, so it is driven directly and Faugus' library is left alone.
+--------------------------------------------------------------------------
+
+-- Faugus' own runner, shipped with the native package.
+local function umuBinary()
+  return homeDir() .. "/.local/share/faugus-launcher/umu-run"
+end
+
+-- Mirrors Faugus' launch builder: the same Proton name it hands umu, the
+-- same Steam compatibility tools, the same container mode. UMU_RUNTIME is
+-- deliberately absent - Faugus never sets it either.
+local function faugusEnv(prefix)
+  local components = homeDir() .. "/.local/share/faugus-launcher/components"
+  local parts = {
+    "WINEPREFIX=" .. shellQuote(prefix),
+    "PROTONPATH=" .. shellQuote("Proton-CachyOS Latest"),
+    "UMU_USE_STEAM=0",
+    "UMU_CONTAINER_NSENTER=1",
+    "UMU_SKIP_SBOX=1",
+    "PROTON_USE_SBOX=0",
+  }
+  if noctalia.fileExists(components .. "/eac") then
+    table.insert(parts, "PROTON_EAC_RUNTIME=" .. shellQuote(components .. "/eac"))
+  end
+  if noctalia.fileExists(components .. "/be") then
+    table.insert(parts, "PROTON_BATTLEYE_RUNTIME=" .. shellQuote(components .. "/be"))
+  end
+  return parts
+end
+
+-- A prefix per game, so a broken run never poisons another one. umu
+-- creates the directory on the first launch.
+local function prefixFor(exePath)
+  -- Para evitar rutas demasiado largas o caracteres extraños, 
+  -- usamos un slug simple basado en el nombre del archivo.
+  local name = exePath:match("([^/]+)$") or "game"
+  local slug = name:lower():gsub("%.exe$", "")
+  slug = slug:gsub("[^%w%-]+", "-"):gsub("^[%-]+", ""):gsub("[%-$]+", "")
+  if slug == "" then slug = "game" end
+  -- Faugus usa /home/spawnenl/Faugus por defecto según su config.json
+  return homeDir() .. "/Faugus/" .. slug
+end
+
+launchExeWithFaugus = function(exePath, gameName)
+  -- Se abre con el mismo lanzador que usa el explorador de archivos
+  -- (~/.local/bin/faugus-open). Ese script arranca el juego con gamescope
+  -- (ventana propia a 1920x1080, sin que el mosaico de niri lo rompa),
+  -- exporta WINEPREFIX/PROTONPATH para que Faugus no los pise con el
+  -- "default-runner" de config.json, y borra el crash.info que hace que
+  -- Uncharted pregunte por el "modo seguro" y se cierre.
+  local opener = homeDir() .. "/.local/bin/faugus-open"
+  if not noctalia.fileExists(opener) then
+    browseError = "No se encontró faugus-open en " .. opener
+    render()
+    return
+  end
+
+  -- Se arranca con el cwd en la carpeta del juego, como cuando se abre a
+  -- mano; el lanzador se encarga de las comillas de la ruta.
+  local dir = exePath:match("^(.*)/[^/]+$") or ""
+  local cmd = "cd " .. shellQuote(dir) .. " && setsid -f "
+    .. shellQuote(opener) .. " " .. shellQuote(exePath)
+
+  local ok, err = pcall(function()
+    return noctalia.runAsync(cmd, function(res)
+      if res and res.exitCode ~= 0 then
+        noctalia.log("faugus-launcher exit " .. tostring(res.exitCode) .. ": "
+          .. tostring(res.stderr or res.stdout or ""):sub(1, 300))
+      end
+    end)
+  end)
+
+  if not ok or err == false then
+    browseError = "No se pudo arrancar el juego con Faugus."
+    noctalia.log("launchExeWithFaugus: " .. tostring(err))
+    render()
+    return
+  end
+  onClose()
+end
+
+local function applyBrowseFilter()
+  if searchText == "" then
+    browseFiltered = browseEntries
+  else
+    local needle = searchText:lower()
+    local matches = {}
+    for _, entry in ipairs(browseEntries) do
+      if entry.name:lower():find(needle, 1, true) then
+        table.insert(matches, entry)
+      end
+    end
+    browseFiltered = matches
+  end
+  if browseIndex > #browseFiltered - 1 then browseIndex = #browseFiltered - 1 end
+  if browseIndex < 0 then browseIndex = 0 end
+end
+
+local function joinPath(dir, name)
+  if dir == "/" then return "/" .. name end
+  return dir .. "/" .. name
+end
+
+loadBrowseDir = function(path)
+  -- El listado va por un proceso aparte: hacer fileInfo() de cada entrada
+  -- aquí dentro agotaba el presupuesto de 25 ms del callback (una carpeta
+  -- como un árbol de compilación de Wine lo desbordaba y Noctalia acababa
+  -- desactivando el script).
+  local token = browseScanToken + 1
+  browseScanToken = token
+  browseDisks = false
+  browsePath = path
+  browseEntries = {}
+  browseFiltered = {}
+  browseIndex = 0
+  browseError = ""
+  browseLoading = true
+  render()
+  -- Directorios y ejecutables, una línea por entrada: "d<TAB>nombre".
+  local cmd = "find " .. shellQuote(path)
+    .. " -mindepth 1 -maxdepth 1 \\( -type d -o -iname '*.exe' \\)"
+    .. " -printf '%y\\t%f\\n' 2>/dev/null | LC_ALL=C sort -f"
+  local ok = noctalia.runAsync(cmd, function(res)
+    if browseScanToken ~= token then return end -- sustituido por otra lectura
+    browseLoading = false
+    local list = {}
+    for line in (res.stdout or ""):gmatch("[^\n]+") do
+      local kind, name = line:match("^(%a)\t(.+)$")
+      if kind and name and name ~= "." and name ~= ".." then
+        table.insert(list, { name = name, path = joinPath(path, name), isDir = kind == "d" })
+      end
+    end
+    if #list == 0 and (res.exitCode or 1) ~= 0 then
+      browseError = "No se pudo leer " .. path
+      if res.stderr and #res.stderr > 0 then
+        browseError = browseError .. ": " .. res.stderr:sub(1, 120)
+      end
+    end
+    browsePath = path
+    browseEntries = list
+    browseIndex = 0
+    applyBrowseFilter()
+    revealBrowse()
+    render()
+  end)
+  if not ok then
+    browseLoading = false
+    browseError = "No se pudo listar " .. path
+    render()
+  end
+end
+
+local function formatSize(bytes)
+  local value = tonumber(bytes) or 0
+  local units = { "B", "KB", "MB", "GB", "TB" }
+  local index = 1
+  while value >= 1024 and index < #units do
+    value = value / 1024
+    index = index + 1
+  end
+  if index == 1 then return string.format("%d %s", value, units[index]) end
+  return string.format("%.1f %s", value, units[index])
+end
+
+-- Mount points that belong to the running system rather than to a disk the
+-- user would want to browse. "/" matches by equality alone, otherwise
+-- every path would start with it.
+local SYSTEM_MOUNTS = { "/boot", "/var", "/usr", "/etc", "/opt", "/snap", "/nix", "/tmp" }
+
+local function isSystemMount(mp)
+  if not mp or mp == "" then return true end -- not mounted at all
+  if mp:sub(1, 1) == "[" then return true end -- [SWAP] and friends
+  if mp == "/" then return true end -- the system itself
+  -- Everything under /run is session plumbing (tmpfs, credentials) apart
+  -- from /run/media, which is where removable disks land.
+  if mp == "/run" then return true end
+  if mp:find("/run/", 1, true) == 1 and mp:find("/run/media/", 1, true) ~= 1 then
+    return true
+  end
+  for _, root in ipairs(SYSTEM_MOUNTS) do
+    if mp == root or mp:find(root .. "/", 1, true) == 1 then return true end
+  end
+  return false
+end
+
+local function collectDisks(devices, list)
+  for _, dev in ipairs(devices) do
+    if dev.children then collectDisks(dev.children, list) end
+    if dev.mountpoint and not isSystemMount(dev.mountpoint) then
+      local label = (dev.label and #dev.label > 0) and dev.label or (dev.name or "?")
+      table.insert(list, {
+        name = label,
+        path = dev.mountpoint,
+        isDir = true,
+        detail = formatSize(dev.size),
+      })
+    end
+  end
+end
+
+loadBrowseDisks = function()
+  browseDisks = true
+  browsePath = ""
+  browseEntries = {}
+  browseFiltered = {}
+  browseIndex = 0
+  browseError = ""
+  browseLoading = true
+  local token = browseScanToken + 1
+  browseScanToken = token
+  render()
+  local ok = noctalia.runAsync("lsblk -b -J -o NAME,SIZE,LABEL,MOUNTPOINT,TYPE", function(res)
+    if browseScanToken ~= token then return end -- superseded by a newer read
+    browseLoading = false
+    local list = {}
+    local decoded, data = pcall(noctalia.json.decode, res.stdout or "")
+    if res.exitCode == 0 and decoded and data and data.blockdevices then
+      collectDisks(data.blockdevices, list)
+      browseEntries = list
+      browseError = ""
+    else
+      browseError = "No se pudo leer los discos."
+      if res.stderr and #res.stderr > 0 then
+        browseError = browseError .. ": " .. res.stderr:sub(1, 120)
+      end
+    end
+    browseIndex = 0
+    applyBrowseFilter()
+    revealBrowse()
+    render()
+  end)
+  if not ok then
+    browseLoading = false
+    browseError = "No se pudo arrancar lsblk."
+    render()
+  end
+end
+
+local function browseActivate(entry)
+  if not entry then return end
+  if entry.isDir then
+    loadBrowseDir(entry.path)
+  elseif activeTab == TAB_ADD then
+    -- No se añade al vuelo: se pide el nombre para poder buscar la portada.
+    addExePath = entry.path
+    addName = nameForAdd(entry.path)
+    render()
+  else
+    launchExeWithFaugus(entry.path, entry.name)
+  end
+end
+
+local function backToFolder()
+  if browseDisks then
+    loadBrowseDir(homeDir())
+  elseif browsePath == "" or browsePath == "/" then
+    loadBrowseDisks()
+  else
+    local parent = browsePath:match("^(.*)/[^/]+$")
+    if not parent or parent == "" then parent = "/" end
+    loadBrowseDir(parent)
+  end
+end
+
+--------------------------------------------------------------------------
+-- Juegos que solo existen en el menú de aplicaciones
+--
+-- The scanner underneath only knows Steam, Lutris and Heroic, so a
+-- hand-written .desktop can never show up on its own. The list is kept
+-- explicit rather than reading every Categories=Game file on the system:
+-- that would flood the panel with the bundled GNOME games and with the
+-- store launchers, which are already scanned as their own runners.
+--------------------------------------------------------------------------
+
+-- .desktop propios que añaden una segunda forma de abrir un juego (una
+-- variante con gamescope) sin duplicarlo en la lista: plegada en su título
+-- base por foldVariants, y ofrecida al pulsar la fila. También entran aquí
+-- los juegos que solo existen como .desktop (League of Legends vía
+-- darling-lol). La lista se limita a estos id, para no arrastrar el resto de
+-- la categoría Game (launchers y tiendas, que ya se escanean como runners
+-- propios).
+local DESKTOP_GAMES = {
+  "stellar-blade-gamescope",
+  "mortal-kombat-1-gamescope",
+  "gears-e-day-gamescope",
+  "league-of-legends",
+  "mortal-shell-2-gamescope",
+  "ctr-nitro-fueled",
+  "infamous-second-son",
+}
+
+local function parseDesktopEntry(id)
+  local path = homeDir() .. "/.local/share/applications/" .. id .. ".desktop"
+  if not noctalia.fileExists(path) then return nil end
+  local text = noctalia.readFile(path)
+  if not text or #text == 0 then return nil end
+
+  -- Only the [Desktop Entry] group; localized keys such as Name[es] and
+  -- groups such as Desktop Action are deliberately ignored.
+  local inGroup, name, icon, typ, cats, hidden = false, nil, nil, nil, nil, false
+  for line in text:gmatch("[^\n]+") do
+    if line:sub(1, 1) == "[" then
+      inGroup = (line:match("^%[Desktop Entry%]") ~= nil)
+    elseif inGroup then
+      local k, v = line:match("^([%w%-]+)=(.*)$")
+      if k then
+        if k == "Name" and not name then
+          name = v
+        elseif k == "Icon" then
+          icon = v
+        elseif k == "Type" then
+          typ = v
+        elseif k == "Categories" then
+          cats = v
+        elseif k == "Hidden" or k == "NoDisplay" then
+          if v:lower() == "true" then hidden = true end
+        end
+      end
+    end
+  end
+
+  if hidden or typ ~= "Application" then return nil end
+  if not name or name == "" then return nil end
+  if cats and not cats:lower():find("game", 1, true) then return nil end
+
+  -- A hand-picked cover (2:3) wins over the .desktop icon: put one in
+  -- <data>/noctalia/game-covers/<id>.jpg to replace a generic icon.
+  local custom = homeDir() .. "/.local/share/noctalia/game-covers/" .. id .. ".jpg"
+  local cover = (icon and noctalia.fileExists(icon)) and icon or ""
+  if noctalia.fileExists(custom) then cover = custom end
+
+  return {
+    id = id,
+    name = name,
+    runner = "desktop",
+    -- Absolute paths only: the bare icon names used by system packages are
+    -- resolved by the desktop and would fail the check in renderGameRow.
+    cover = cover,
+    cover_url = "",
+    run_command = "desktop://" .. path,
+    slug = "",
+  }
+end
+
+local function appendDesktopGames()
+  for _, id in ipairs(DESKTOP_GAMES) do
+    local entry = parseDesktopEntry(id)
+    if entry then
+      local duplicate = false
+      for _, g in ipairs(games) do
+        if g.id == entry.id or g.name == entry.name then
+          duplicate = true
+          break
+        end
+      end
+      if not duplicate then
+        -- Inserta en orden alfabético (igual que el escáner) para que las
+        -- variantes de un mismo juego ("X" y "X (gamescope)") queden juntas.
+        local key = entry.name:lower()
+        local pos = #games + 1
+        for i, g in ipairs(games) do
+          if tostring(g.name or ""):lower() > key then
+            pos = i
+            break
+          end
+        end
+        table.insert(games, pos, entry)
+      end
+    end
+  end
+end
+
+---------------------------------------------------------------------------
+--- Juegos locales de disco: se abren con la aplicación de Faugus, sin pasar
+--- por su biblioteca, porque viven fuera de Steam/Lutris/Heroic.
+---------------------------------------------------------------------------
+
+-- Portada guardada en los datos del plugin (no en ~/.cache, que se puede
+-- limpiar). Se usa tal cual: aquí no se busca nada en Steam.
+local function bundledCover(file)
+  local ok, dir = pcall(noctalia.pluginDataDir)
+  if not (ok and dir and #dir > 0) then return "" end
+  local p = dir .. "/covers/" .. file
+  if noctalia.fileExists(p) then return p end
+  return ""
+end
+
+local EXTERNAL_GAMES = {
+  {
+    id = "united4",
+    name = "Uncharted 4 Legacy of Thieves Collection",
+    runner = "external",
+    -- Carátula de UNCHARTED: Legacy of Thieves Collection (Steam 1659420),
+    -- copiada a los datos del plugin. Es la buena; la anterior era de otro
+    -- juego porque la búsqueda automática acertó mal.
+    cover = bundledCover("uncharted4.jpg"),
+    cover_url = "",
+    exe = "/run/media/spawnenl/enl/GAME/Uncharted 4 Legacy of Thieves Collection/u4.exe",
+  },
+}
+
+---------------------------------------------------------------------------
+--- Juegos añadidos desde la pestaña "Añadir juego"
+---
+--- Viven en un JSON dentro del directorio de datos del plugin, así que
+--- sobreviven a un reescaneo y a reiniciar Noctalia. El .exe se abre con
+--- Faugus, igual que los juegos externos de la lista de arriba.
+---------------------------------------------------------------------------
+
+local externalExtra = {}
+
+local function externalStorePath()
+  local ok, dir = pcall(noctalia.pluginDataDir)
+  if ok and dir and #dir > 0 then return dir .. "/external-games.json" end
+  return nil
+end
+
+local function loadExternalExtra()
+  local path = externalStorePath()
+  if not path or not noctalia.fileExists(path) then return end
+  local text = noctalia.readFile(path)
+  if not text or #text == 0 then return end
+  local ok, data = pcall(noctalia.json.decode, text)
+  if ok and type(data) == "table" then
+    for _, g in ipairs(data) do
+      if type(g) == "table" and g.exe and g.name then
+        table.insert(externalExtra, g)
+      end
+    end
+  end
+end
+
+local function saveExternalExtra()
+  local path = externalStorePath()
+  if not path then return end
+  local ok, text = pcall(noctalia.json.encode, externalExtra)
+  if ok and text then pcall(noctalia.writeFile, path, text) end
+end
+
+loadExternalExtra()
+
+local function appendExternalGames()
+  local function merge(list)
+    for _, g in ipairs(list) do
+      local duplicate = false
+      for _, e in ipairs(games) do
+        if e.id == g.id or e.name == g.name then
+          duplicate = true
+          break
+        end
+      end
+      if not duplicate then
+        table.insert(games, g)
+      end
+    end
+  end
+  merge(EXTERNAL_GAMES)
+  merge(externalExtra)
+  table.sort(games, function(a, b)
+    return tostring(a.name or ""):lower() < tostring(b.name or ""):lower()
+  end)
+end
+
+-- Nombre legible a partir del .exe: la carpeta del juego suele describirlo
+-- mejor que el binario ("u4.exe" dentro de "Uncharted 4 Legacy of Thieves
+-- Collection"). Carpetas genéricas se ignoran y se usa el nombre del .exe.
+local GENERIC_FOLDERS = {
+  bin = true, binaries = true, win64 = true, win32 = true, x64 = true,
+  x86 = true, game = true, games = true, build = true, release = true,
+  windows = true, system32 = true, syswow64 = true, system = true,
+  ["program files"] = true, ["program files (x86)"] = true,
+  ["common files"] = true, steamapps = true, common = true,
+}
+
+local function nameFromExe(exePath)
+  local file = exePath:match("([^/]+)$") or "Juego"
+  local base = file:gsub("%.[eE][xX][eE]$", ""):gsub("[_]+", " ")
+  local parent = exePath:match("^(.*)/[^/]+$") or ""
+  local folder = parent:match("([^/]+)$")
+  -- La carpeta solo manda si describe más que el binario ("u4.exe" dentro de
+  -- "Uncharted 4 Legacy of Thieves Collection") y no es una carpeta genérica.
+  if folder and #folder > #base and not GENERIC_FOLDERS[folder:lower()] then
+    return (folder:gsub("[_]+", " "))
+  end
+  return base
+end
+
+-- Nombre sugerido para la caja de texto del paso de nombre.
+nameForAdd = function(exePath)
+  return nameFromExe(exePath)
+end
+
+local function slugifyName(text)
+  local slug = tostring(text or ""):lower()
+  slug = slug:gsub("[^%w%-]+", "-"):gsub("^[%-]+", ""):gsub("[%-$]+", "")
+  if slug == "" then slug = "juego" end
+  return slug
+end
+
+local function uniqueGameId(base)
+  local id, n = base, 2
+  while true do
+    local taken = false
+    for _, g in ipairs(games) do
+      if g.id == id then taken = true break end
+    end
+    if not taken then
+      for _, g in ipairs(externalExtra) do
+        if g.id == id then taken = true break end
+      end
+    end
+    if not taken then return id end
+    id = base .. "-" .. n
+    n = n + 1
+  end
+end
+
+-- Portada opcional: busca el título en la tienda de Steam y baja su retrato
+-- 600x900 (o la cabecera 460x215 si el juego no tiene retrato). Después deja
+-- preparada la animación del disco, para que la caja la tenga la primera vez.
+
+-- Palabras que no sirven para distinguir un juego de otro, o que solo dicen
+-- de qué edición se trata.
+local COVER_STOPWORDS = {
+  ["of"] = true, ["the"] = true, ["a"] = true, ["an"] = true,
+  ["and"] = true, ["collection"] = true, ["edition"] = true,
+  ["definitive"] = true, ["remastered"] = true, ["deluxe"] = true,
+  ["complete"] = true, ["goty"] = true, ["game"] = true, ["year"] = true,
+}
+
+-- "UNCHARTED™: Legacy of Thieves Collection" -> {"uncharted", "legacy", "thieves"}
+local function coverWords(s)
+  s = tostring(s or ""):lower():gsub("™", ""):gsub("®", ""):gsub("©", "")
+  s = s:gsub("[^%w%s]", " "):gsub("%s+", " ")
+  local out = {}
+  for w in s:gmatch("%S+") do
+    if not COVER_STOPWORDS[w] then out[#out + 1] = w end
+  end
+  return out
+end
+
+-- Parecido entre dos títulos: palabras en común / palabras del más largo.
+-- Así "Uncharted 4 Legacy of Thieves Collection" casa con "Uncharted: Legacy
+-- of Thieves Collection" (0,75) aunque no sean idénticos ni se contengan.
+local function coverScore(a, b)
+  local A, B = coverWords(a), coverWords(b)
+  if #A == 0 or #B == 0 then return 0 end
+  local set = {}
+  for _, w in ipairs(A) do set[w] = true end
+  local hits = 0
+  for _, w in ipairs(B) do if set[w] then hits = hits + 1 end end
+  return hits / math.max(#A, #B)
+end
+
+local function applyCover(g, dest)
+  pcall(function()
+    g.cover = dest
+    coverExists[dest] = true
+    -- El JSON se guardó antes de bajar la portada: se vuelve a escribir para
+    -- que la caja la conserve al reiniciar.
+    saveExternalExtra()
+    render()
+    -- Portada nueva => el disco se rehace con ella.
+    if prepareDisc then prepareDisc(g, true) end
+  end)
+end
+
+-- Los juegos nuevos de Steam ya no sirven la portada en la ruta fija
+-- .../steam/apps/<id>/library_600x900.jpg: la guardan en una carpeta con hash
+-- y solo la tienda conoce la URL. Cuando falla la ruta clásica se pide esa
+-- cabecera a la API y se compone un retrato 600x900 con ella.
+local function buildPortrait(src, dest)
+  local cmd = "magick \\( " .. shellQuote(src) .. " -resize \"600x900^\" -gravity center"
+    .. " -extent 600x900 -blur 0x28 -modulate 62 \\) \\( " .. shellQuote(src)
+    .. " -resize \"600x310\" \\) -gravity center -composite " .. shellQuote(dest)
+    .. " && rm -f " .. shellQuote(src)
+  return cmd
+end
+
+local function downloadCoverFor(g, appid)
+  local dest = steamCoverDir .. "/" .. g.id .. "_p.jpg"
+  local id = tostring(appid)
+  local cdn = "https://cdn.cloudflare.steamstatic.com/steam/apps/" .. id
+
+  -- 2) Juego nuevo: la API de la tienda da la URL real de la cabecera.
+  local function viaStoreApi()
+    local ok = pcall(function()
+      noctalia.http({
+        url = "https://store.steampowered.com/api/appdetails?appids=" .. id .. "&l=english",
+      }, function(res)
+        pcall(function()
+          if not (res and res.ok and res.status == 200) then return end
+          local decoded, data = pcall(noctalia.json.decode, res.body or "")
+          if not decoded or type(data) ~= "table" then return end
+          local entry = data[id]
+          local header = entry and entry.data and entry.data.header_image
+          if type(header) ~= "string" then return end
+          local tmp = dest .. ".hdr.jpg"
+          noctalia.download(header, tmp, function(ok2)
+            pcall(function()
+              if not (ok2 and noctalia.fileExists(tmp)) then return end
+              noctalia.runAsync(buildPortrait(tmp, dest), function(r2)
+                pcall(function()
+                  if r2 and r2.exitCode == 0 and noctalia.fileExists(dest) then
+                    applyCover(g, dest)
+                  else
+                    -- Sin ImageMagick o sin cabecera: se deja la imagen tal cual.
+                    if noctalia.fileExists(tmp) then
+                      pcall(noctalia.copyFile, tmp, dest)
+                    end
+                    if noctalia.fileExists(dest) then applyCover(g, dest) end
+                  end
+                end)
+              end)
+            end)
+          end)
+        end)
+      end)
+    end)
+    if not ok then noctalia.log("downloadCoverFor: fallo pidiendo la API de la tienda") end
+  end
+
+  noctalia.download(cdn .. "/library_600x900.jpg", dest, function(ok2)
+    pcall(function()
+      if ok2 and noctalia.fileExists(dest) then
+        applyCover(g, dest)
+        return
+      end
+      -- 1) Juegos anteriores a 2022: la cabecera sí está en la ruta clásica.
+      noctalia.download(cdn .. "/header.jpg", dest, function(ok3)
+        pcall(function()
+          if ok3 and noctalia.fileExists(dest) then
+            applyCover(g, dest)
+          else
+            viaStoreApi()
+          end
+        end)
+      end)
+    end)
+  end)
+end
+
+local function fetchCoverByName(g)
+  local dest = steamCoverDir .. "/" .. g.id .. "_p.jpg"
+  if noctalia.fileExists(dest) then
+    g.cover = dest
+    if prepareDisc then prepareDisc(g) end
+    return
+  end
+
+  local words = coverWords(g.name)
+  if #words == 0 then return end
+
+  -- La tienda no entiende títulos largos: "Uncharted 4 Legacy of Thieves
+  -- Collection" devuelve 0 resultados y "Uncharted" sí lo encuentra. Se
+  -- prueban el nombre entero y variantes cada vez más cortas hasta que
+  -- alguna coincidencia pase de 0,6 de parecido.
+  local best, bestScore = nil, 0
+
+  local function search(n)
+    if n < 1 then
+      if best then downloadCoverFor(g, best.id) end
+      return
+    end
+    local picked = {}
+    for i = 1, n do picked[i] = words[i] end
+    local term = table.concat(picked, "+")
+    local url = "https://store.steampowered.com/api/storesearch/?term="
+      .. term .. "&l=english&cc=US&count=10"
+    local ok = pcall(function()
+      noctalia.http({ url = url }, function(res)
+        pcall(function()
+          if res and res.ok and res.status == 200 then
+            local decoded, data = pcall(noctalia.json.decode, res.body or "")
+            if decoded and type(data) == "table" and type(data.items) == "table" then
+              for _, item in ipairs(data.items) do
+                if item.id then
+                  local sc = coverScore(g.name, item.name)
+                  if sc > bestScore then best, bestScore = item, sc end
+                end
+              end
+            end
+          end
+          if bestScore >= 0.6 and best then
+            downloadCoverFor(g, best.id)
+          elseif n > 1 then
+            search(n - 1)
+          elseif best then
+            downloadCoverFor(g, best.id)   -- último recurso: la mejor que haya
+          end
+        end)
+      end)
+    end)
+    if not ok then noctalia.log("fetchCoverByName: no se pudo consultar la tienda") end
+  end
+  search(#words)
+end
+
+addGameFromExe = function(exePath, gameName)
+  if not exePath or #exePath == 0 then return nil end
+  -- Mismo .exe ya conocido (en memoria o en el JSON): se reutiliza.
+  for _, g in ipairs(games) do
+    if g.runner == "external" and g.exe == exePath then return g end
+  end
+  for _, g in ipairs(externalExtra) do
+    if g.exe == exePath then return g end
+  end
+  -- El nombre lo escribe el usuario en el paso anterior; si viene vacío se
+  -- deduce del .exe. Es el que se usa para buscar la portada en Steam.
+  local name = tostring(gameName or ""):gsub("^%s+", ""):gsub("%s+$", "")
+  name = name:gsub("%s+", " ")
+  if name == "" then name = nameFromExe(exePath) end
+  -- Ya hay un juego con ese título (dos .exe en la misma carpeta): se
+  -- distingue con el nombre del binario para no tener dos filas iguales.
+  local nameLower = name:lower()
+  local function sameName(other)
+    return tostring(other.name or ""):lower() == nameLower
+  end
+  local taken = false
+  for _, other in ipairs(games) do
+    if sameName(other) then taken = true break end
+  end
+  if not taken then
+    for _, other in ipairs(externalExtra) do
+      if sameName(other) then taken = true break end
+    end
+  end
+  if taken then
+    local base = (exePath:match("([^/]+)$") or ""):gsub("%.[eE][xX][eE]$", "")
+    name = name .. " (" .. base .. ")"
+  end
+  local g = {
+    id = uniqueGameId(slugifyName(name)),
+    name = name,
+    runner = "external",
+    cover = "",
+    cover_url = "",
+    exe = exePath,
+    -- Marcado como añadido con el botón: solo estos buscan portada y disco
+    -- automáticamente.
+    autoCover = true,
+  }
+  table.insert(games, g)
+  table.insert(externalExtra, g)
+  saveExternalExtra()
+  fetchCoverByName(g)
+  return g
+end
+
+local function appendDesktopAndExternalGames()
+  pcall(appendDesktopGames)
+  pcall(appendExternalGames)
+end
+
+---------------------------------------------------------------------------
+--- Plegado de variantes: "Stellar Blade (gamescope)" deja de ocupar su
+--- propia fila en cuanto su título base está en la lista, para que el juego
+--- se enseñe una sola vez. Sus otras formas de abrirse aparecen al pulsar la
+--- fila. Si el base no llega a pasar los filtros, la variante queda a solas
+--- y sigue siendo localizable por su nombre.
+---------------------------------------------------------------------------
+
+local function isVariant(name)
+  return tostring(name or ""):find("%b()") ~= nil
+end
+
+local function baseTitle(name)
+  return (tostring(name or ""):gsub("%s*%b()$", "")):lower()
+end
+
+local function foldVariants(list)
+  local bases = {}
+  for _, g in ipairs(list) do
+    if not isVariant(g.name) then bases[baseTitle(g.name)] = true end
+  end
+  local out = {}
+  for _, g in ipairs(list) do
+    if not (isVariant(g.name) and bases[baseTitle(g.name)]) then
+      table.insert(out, g)
+    end
+  end
+  return out
+end
+
+-- Índice por título base. expandableVariants() se llama una vez por fila en
+-- cada render; recalcularlo recorriendo todo `games` era O(n²) y podía agotar
+-- el presupuesto de CPU del callback.
+local variantsByBase = {}
+
+local function rebuildVariantIndex()
+  local idx = {}
+  for _, g in ipairs(games) do
+    local base = baseTitle(g.name)
+    local list = idx[base]
+    if not list then list = {}; idx[base] = list end
+    table.insert(list, g)
+  end
+  variantsByBase = idx
+end
+
+local function filterGames(text)
+  rebuildVariantIndex()
+  local pool = {}
+  for _, g in ipairs(games) do
+    -- Temporales: "League of Maidens" y el placeholder "appid_350470" fueron
+    -- retirados del launcher a petición del usuario y no entran en la vitrina.
+    local nameLower = tostring(g.name or ""):lower()
+    if nameLower ~= "league of maidens" and nameLower ~= "appid_350470" then
+      if filterByRunner(g) then
+        table.insert(pool, g)
+      end
+    end
+  end
+  if text == "" then
+    filtered = foldVariants(pool)
+    return
+  end
+  local lower = text:lower()
+  local result = {}
+  for _, g in ipairs(pool) do
+    if g.name:lower():find(lower, 1, true) or g.runner:lower():find(lower, 1, true) then
+      table.insert(result, g)
+    end
+  end
+  filtered = foldVariants(result)
+end
+
+local function isImageFile(path)
+  return noctalia.fileExists(path)
+end
+
+local function fetchSteamStoreCover(g, dest, cb)
+  noctalia.http({ url = "https://store.steampowered.com/api/appdetails?appids=" .. g.id }, function(res2)
+    pcall(function()
+      if res2.ok and res2.status == 200 then
+        local ok2, data2 = pcall(noctalia.json.decode, res2.body)
+        if ok2 and data2 then
+          local appData = data2[g.id]
+          if appData and appData.data and appData.data.header_image then
+            noctalia.download(appData.data.header_image, dest, function(ok3)
+              pcall(function() if ok3 then g.cover = dest; render() end end)
+            end)
+            return
+        end
+      end
+      end
+    end)
+  end)
+end
+
+local function fetchSteampoacherCover(g, dest, fallback)
+  noctalia.http({ url = "https://steam-asset-proxy.steampoacher.workers.dev?appid=" .. g.id }, function(res)
+    pcall(function()
+      if res.ok and res.status == 200 then
+        local ok, data = pcall(noctalia.json.decode, res.body)
+        if ok and data and data.response and data.response.store_items then
+          local item = data.response.store_items[1]
+          if item and item.assets then
+            local assets = item.assets
+            local filename = assets.library_capsule_2x or assets.library_capsule or assets.header
+            local fmt = assets.asset_url_format
+            if filename and fmt then
+              local placeholder = "${FILENAME}"
+              local pos = fmt:find(placeholder, 1, true)
+              local cdnUrl
+              if pos then
+                local prefix = fmt:sub(1, pos - 1)
+                local suffix = fmt:sub(pos + #placeholder)
+                cdnUrl = "https://shared.steamstatic.com/store_item_assets/" .. prefix .. filename .. suffix
+              else
+                cdnUrl = "https://shared.steamstatic.com/store_item_assets/" .. fmt .. "/" .. filename
+              end
+              noctalia.download(cdnUrl, dest, function(ok2)
+                pcall(function()
+                  if ok2 then g.cover = dest; render() return end
+                  fallback()
+                end)
+              end)
+              return
+            end
+          end
+        end
+      end
+      pcall(function() fallback() end)
+    end)
+  end)
+end
+
+-- Retrato de caja (600x900) del CDN de Steam: es la carátula que usa la
+-- estantería. Si la app no lo tiene (juegos retirados, apps que no son
+-- juegos...), se cae al header apaisado de la API de la tienda.
+local function fetchSteamPortraitCover(g, dest, fallback)
+  local url = "https://cdn.cloudflare.steamstatic.com/steam/apps/" .. g.id .. "/library_600x900.jpg"
+  noctalia.download(url, dest, function(ok)
+    pcall(function()
+      if ok then
+        g.cover = dest
+        render()
+      else
+        fallback()
+      end
+    end)
+  end)
+end
+
+local function downloadSteamCover(g)
+  local ok, err = pcall(function()
+    -- _p: retrato. Nombre distinto del .jpg apaisado que cachea el escáner,
+    -- así las carátulas viejas no impiden pedir la caja vertical.
+    local dest = steamCoverDir .. "/" .. g.id .. "_p.jpg"
+    if isImageFile(dest) then
+      g.cover = dest
+      return
+    end
+    local steampoacherEnabled = false
+    local okc, val = pcall(noctalia.getConfig, "steampoacher_enabled")
+    if okc then
+      steampoacherEnabled = val == true or val == "true"
+    end
+    local function headerCover()
+      fetchSteamStoreCover(g, dest)
+    end
+    local function portraitCover()
+      fetchSteamPortraitCover(g, dest, headerCover)
+    end
+    if steampoacherEnabled then
+      fetchSteampoacherCover(g, dest, portraitCover)
+    else
+      portraitCover()
+    end
+  end)
+  if not ok then
+    noctalia.log("downloadSteamCover error: " .. tostring(err))
+  end
+end
+
+local function downloadHeroicCover(g)
+  local ok, err = pcall(function()
+    if g.cover and #g.cover > 0 then return end
+    if not g.cover_url or #g.cover_url == 0 then return end
+    local dest = heroicCoverDir .. "/" .. g.id .. ".jpg"
+    if isImageFile(dest) then
+      g.cover = dest
+      return
+    end
+    noctalia.download(g.cover_url, dest, function(ok2)
+      pcall(function()
+        if ok2 then g.cover = dest; render() end
+      end)
+    end)
+  end)
+  if not ok then
+    noctalia.log("downloadHeroicCover error: " .. tostring(err))
+  end
+end
+
+local function fetchMissingCovers()
+  for _, g in ipairs(games) do
+    if g.runner == "steam" then
+      downloadSteamCover(g)
+    elseif g.runner == "heroic" then
+      downloadHeroicCover(g)
+    elseif g.runner == "external" then
+      -- Solo los juegos añadidos con el botón "Añadir juego" (autoCover)
+      -- buscan portada en Steam. Los fijados a mano o los que ya estaban no
+      -- se tocan: cada uno se queda con la imagen que tenga.
+      local has = g.cover and #g.cover > 0 and noctalia.fileExists(g.cover)
+      if not has and g.autoCover then
+        fetchCoverByName(g)
+      elseif has and prepareDisc then
+        prepareDisc(g)
+      end
+    end
+  end
+end
+
+local runnerMeta = {
+  steam = { glyph = "brand-steam", color = "#66c0f4" },
+  lutris = { glyph = "device-gamepad", color = "#ff6600" },
+  heroic = { glyph = "rocket", color = "#a78bfa" },
+  desktop = { glyph = "grid-dots", color = "#34d399" },
+  -- Juego local que se lanza con el motor de Faugus (umu-run): el logo que
+  -- usa Faugus para identificarse como launcher.
+  external = { glyph = "device-gamepad", color = "#e879f9" },
+}
+
+-- Accesos directos a los launchers instalados, arriba junto a "Examinar".
+-- Steam y Heroic se lanzan con su versión Flatpak (flatpak run <id>): el
+-- .desktop nativo y el exportado por Flatpak comparten el mismo id, así que
+-- gio launch acabaría siempre en la instalación nativa.
+local launcherShortcuts = {
+  {
+    id = "steam", label = "Steam", glyph = "brand-steam", color = "#66c0f4",
+    flatpak = "com.valvesoftware.Steam",
+    desktop = "/usr/share/applications/steam.desktop",
+    bin = "steam",
+  },
+  {
+    id = "heroic", label = "Heroic", glyph = "rocket", color = "#a78bfa",
+    flatpak = "com.heroicgameslauncher.hgl",
+    desktop = "/usr/share/applications/com.heroicgameslauncher.hgl.desktop",
+    bin = "heroic",
+  },
+  {
+    id = "faugus", label = "Faugus", glyph = "device-gamepad", color = "#e879f9",
+    desktop = "/usr/share/applications/io.github.Faugus.faugus-launcher.desktop",
+    bin = "faugus-launcher",
+  },
+  {
+    id = "lutris", label = "Lutris", glyph = "device-gamepad", color = "#ff6600",
+    desktop = "/usr/share/applications/net.lutris.Lutris.desktop",
+    bin = "lutris",
+  },
+  {
+    id = "quiver", label = "QuiverLauncher", glyph = "grid-dots", color = "#34d399",
+    desktop = homeDir() .. "/.local/share/applications/quiverlauncher-linux-x64.desktop",
+    bin = nil,
+  },
+}
+
+local function launcherShortcutAvailable(s)
+  if s.flatpak and noctalia.commandExists("flatpak") then return true end
+  if s.desktop and noctalia.fileExists(s.desktop) then return true end
+  return s.bin ~= nil and noctalia.commandExists(s.bin) == true
+end
+
+local function launchShortcut(s)
+  -- El acceso directo cierra el panel igual que hace "Jugar" (launchGame
+  -- llama a onClose()): así la ventana del launcher queda a la vista en
+  -- lugar del panel.
+  -- Flatpak primero: flatpak run es inequívoco y no depende del orden de
+  -- preferencia de los manejadores de xdg.
+  if s.flatpak and noctalia.commandExists("flatpak") then
+    -- setsid -f desprende el proceso en otra sesión: sin eso, al cerrar el
+    -- panel su grupo de procesos mataba Steam/Heroic a los ~5 segundos.
+    noctalia.runAsync("setsid -f flatpak run " .. shellQuote(s.flatpak))
+    onClose()
+    return
+  end
+  if s.desktop and noctalia.fileExists(s.desktop) then
+    noctalia.runAsync("gio launch " .. shellQuote(s.desktop), function(res)
+      if res and res.exitCode and res.exitCode ~= 0 then
+        noctalia.log("shortcut " .. s.id .. " falló con exit " .. tostring(res.exitCode))
+      end
+    end)
+    onClose()
+  elseif s.bin and noctalia.commandExists(s.bin) then
+    noctalia.runAsync("setsid -f " .. shellQuote(s.bin))
+    onClose()
+  else
+    noctalia.notify("Game Launcher", "No se encontró " .. s.label)
+  end
+end
+
+-- Nombre legible del runner: "external" es Faugus, el lanzador con el que se
+-- abre un .exe de un disco.
+local function runnerDisplayName(runner)
+  if runner == "external" then return "Faugus" end
+  return tostring(runner or "")
+end
+
+---------------------------------------------------------------------------
+--- Plataforma de consola
+---
+--- Casi todos los juegos muestran en la cabecera de su caja el runner con el
+--- que se abren ("DESKTOP", "Faugus", ...). Los ports de PS4 de la lista
+--- llevan en su lugar el logo de PlayStation y "PS4": el juego viene de la
+--- consola, no de una tienda de PC. Solo cambia la cabecera de estos dos.
+---------------------------------------------------------------------------
+
+local PS4_LOGO = homeDir() .. "/.local/share/noctalia/game-platforms/ps4.png"
+
+local PLATFORM_BADGES = {
+  ["ctr-nitro-fueled"] = { label = "PS4", icon = PS4_LOGO },
+  ["infamous-second-son"] = { label = "PS4", icon = PS4_LOGO },
+}
+
+-- Cabecera de la caja de un juego: plataforma si la tiene, si no el runner.
+local function gameBadge(g)
+  local platform = PLATFORM_BADGES[g.id]
+  if platform then
+    return { label = platform.label, icon = platform.icon, color = "#0070d1" }
+  end
+  local meta = runnerMeta[g.runner] or { glyph = "app-window", color = "on_surface_variant" }
+  return { label = runnerDisplayName(g.runner), glyph = meta.glyph, color = meta.color }
+end
+
+-- Logo de la plataforma si la imagen existe; si no, el glifo del runner.
+local function badgeGlyph(badge, size)
+  if badge.icon and noctalia.fileExists(badge.icon) then
+    return ui.image({
+      path = badge.icon,
+      width = math.max(1, math.floor(size * 1.29)),
+      height = size,
+      fit = "contain",
+    })
+  end
+  return ui.glyph({ name = badge.glyph or "app-window", size = size, color = badge.color })
+end
+
+---------------------------------------------------------------------------
+--- Opciones de lanzamiento: un mismo juego puede abrirse de varias maneras.
+--- La variante lleva su sufijo entre paréntesis ("Stellar Blade (gamescope)"
+--- junto a "Stellar Blade"), así que comparando el título base se enlazan
+--- automáticamente: al pulsar el título normal aparecen todas las formas.
+---------------------------------------------------------------------------
+
+-- Texto dentro del paréntesis: "gamescope", "heroic", ...
+local function variantLabel(name)
+  return tostring(name or ""):match("%((.-)%)") or tostring(name or "")
+end
+
+local function titleCase(s)
+  return (tostring(s or ""):gsub("^%l", string.upper))
+end
+
+-- Solo el título plano despliega; una variante se abre directamente.
+-- Devuelve nil cuando no hay nada más que ofrecer.
+local function expandableVariants(g)
+  if isVariant(g.name) then return nil end
+  local list = variantsByBase[baseTitle(g.name)]
+  if not list or #list < 2 then return nil end
+  local out = {}
+  for _, other in ipairs(list) do
+    if other.id ~= g.id then table.insert(out, other) end
+  end
+  if #out == 0 then return nil end
+  return out
+end
+
+-- Id de la fila base de una variante: para abrir su caja antes de lanzarla.
+local function baseIdOf(g)
+  if not isVariant(g.name) then return g.id end
+  local base = baseTitle(g.name)
+  for _, cand in ipairs(games) do
+    if cand.id ~= g.id and not isVariant(cand.name) and baseTitle(cand.name) == base then
+      return cand.id
+    end
+  end
+  return nil
+end
+
+-- Se muestra sobre la lista, fuera del contenedor con scroll: así las filas
+-- mantienen su altura fija y la rueda sigue calculando bien la selección.
+-- Solo existe mientras haya un expandedId visible en la lista filtrada.
+local function renderLaunchOptions()
+  if not expandedId then return nil end
+
+  local target, variants
+  for _, g in ipairs(filtered) do
+    if g.id == expandedId then
+      target = g
+      variants = expandableVariants(g)
+      break
+    end
+  end
+  if not target or not variants then return nil end
+  -- El foco puede quedar fuera si la lista cambió por debajo.
+  local total = 1 + #variants
+  if optionIndex < 0 or optionIndex > total - 1 then optionIndex = 0 end
+
+  local buttons = {
+    ui.label({
+      text = target.name,
+      fontSize = 12,
+      fontWeight = "bold",
+      color = "on_surface_variant",
+      maxLines = 1,
+    }),
+    ui.button({
+      text = "Con " .. titleCase(runnerDisplayName(target.runner)),
+      glyph = (runnerMeta[target.runner] or {}).glyph or "app-window",
+      variant = optionIndex == 0 and "primary" or "outline",
+      onClick = function() beginLaunch(target) end,
+    }),
+  }
+  for i, v in ipairs(variants) do
+    table.insert(buttons, ui.button({
+      text = "Con " .. variantLabel(v.name),
+      glyph = (runnerMeta[v.runner] or {}).glyph or "grid-dots",
+      variant = optionIndex == i and "primary" or "outline",
+      onClick = function() beginLaunch(v, baseIdOf(v)) end,
+    }))
+  end
+  table.insert(buttons, ui.button({
+    glyph = "x",
+    variant = "ghost",
+    onClick = function() closeLaunchOptions() end,
+  }))
+  return ui.row({ align = "center", gap = 8, paddingH = 10, paddingV = 6, radius = 8 }, buttons)
+end
+
+-- Las opciones visibles, si las hay. Devuelve el juego y sus variantes.
+local function launchOptionsTarget()
+  if not expandedId then return nil end
+  for _, g in ipairs(filtered) do
+    if g.id == expandedId then
+      local variants = expandableVariants(g)
+      if variants then return g, variants end
+      return nil
+    end
+  end
+  return nil
+end
+
+-- Y en el mando: abre las opciones del juego seleccionado. Sin opciones no
+-- hace nada, para no dejar sin efecto un botón que parece una acción.
+function openLaunchOptions()
+  local g = filtered[selectedIndex + 1]
+  if not g then return end
+  if not expandableVariants(g) then return end
+  expandedId = g.id
+  optionIndex = 0
+  render()
+end
+
+function closeLaunchOptions()
+  if not expandedId then return end
+  expandedId = nil
+  optionIndex = 0
+  render()
+end
+
+function stepLaunchOption(step)
+  local _, variants = launchOptionsTarget()
+  if not variants then return end
+  local total = 1 + #variants
+  optionIndex = (optionIndex + step) % total
+  if optionIndex < 0 then optionIndex = optionIndex + total end
+  render()
+end
+
+function confirmLaunchOption()
+  local g, variants = launchOptionsTarget()
+  if not g then return end
+  if optionIndex == 0 then
+    beginLaunch(g)
+  else
+    local v = variants[optionIndex]
+    if v then beginLaunch(v, baseIdOf(v)) end
+  end
+end
+
+local function renderHeader()
+  return ui.row({ align = "center", gap = 8 }, {
+    ui.glyph({ name = "device-gamepad-2", size = 20, color = "primary" }),
+    ui.label({ text = "Game Launcher", fontSize = 18, fontWeight = "bold", color = "primary", flexGrow = 1 }),
+    -- Cuenta lo que la lista enseña: una variante plegada en su base no es
+    -- una fila más.
+    ui.label({ text = "(" .. #filtered .. " games)", color = "on_surface_variant", fontSize = 12 }),
+    ui.button({ glyph = "reload", variant = "ghost", onClick = "onRescan" }),
+    ui.button({ glyph = "close", variant = "ghost", onClick = "onClose" }),
+  })
+end
+
+local function renderSearchBar()
+  return ui.row({ align = "center", gap = 8 }, {
+    ui.glyph({ name = "search", size = 14, color = "on_surface_variant" }),
+    -- ui.input is uncontrolled: the key is what empties it, so it is
+    -- derived from the tab as well as the scan counter.
+    ui.input({
+      key = "search_" .. scanCounter .. "_" .. activeTab,
+      placeholder = (activeTab == TAB_BROWSE and "Buscar en esta carpeta…")
+        or (activeTab == TAB_ADD and "Buscar un .exe…")
+        or "Search games…",
+      onChange = "onSearch",
+      onSubmit = "onSubmitSearch",
+      value = searchText,
+      flexGrow = 1,
+      focus = true,
+    }),
+    ui.button({ glyph = "filter", variant = "ghost", visible = false }),
+  })
+end
+
+local function renderStatus()
+  if loading then
+    return ui.row({ align = "center", justify = "center", flexGrow = 1 }, {
+      ui.label({ text = "Scanning for games…", color = "on_surface_variant" }),
+    })
+  end
+  if errorMsg ~= "" then
+    return ui.column({ align = "center", justify = "center", flexGrow = 1, gap = 12 }, {
+      ui.glyph({ name = "alert-circle", size = 40, color = "error" }),
+      ui.label({ text = errorMsg, color = "error", maxWidth = 400, textAlign = "center" }),
+      ui.button({ text = "Retry", variant = "primary", onClick = "onRescan" }),
+    })
+  end
+  if #filtered == 0 then
+    return ui.row({ align = "center", justify = "center", flexGrow = 1 }, {
+      ui.label({
+        text = #games == 0 and "No games found. Click the reload button to scan." or "No games match your search.",
+        color = "on_surface_variant",
+      }),
+    })
+  end
+  return nil
+end
+
+-- ---------------------------------------------------------------------------
+-- Vitrina vertical (estilo NonDot GameLibrary): cada juego es una caja de
+-- verdad -lomo, cabecera con la plataforma y carátula- apoyada en una balda
+-- de cristal, con el nombre al lado. Al pasar el ratón la caja crece 1.25x,
+-- se enciende su balda y las demás se atenúan, como en el jukebox del repo.
+-- El tamaño lo interpola onFrameTick: la UI de Noctalia no anima sola.
+-- ---------------------------------------------------------------------------
+
+local COVER_H = 160         -- alto de la caja en reposo
+local COVER_GROW = 1.25     -- lo que crece al pasar el ratón (como el repo)
+local COVER_RATIO = 0.693   -- proporción de una caja de juego (2:3)
+local CASE_W_MAX = math.floor(COVER_H * COVER_GROW * COVER_RATIO)
+local STAND_W = CASE_W_MAX + 54
+
+local function focusedGame()
+  local g = filtered[selectedIndex + 1]
+  if hoveredId then
+    for _, h in ipairs(filtered) do
+      if h.id == hoveredId then return h end
+    end
+  end
+  return g
+end
+
+local function coverFor(g)
+  local cp = (g.cover and #g.cover > 0) and g.cover or nil
+  if not cp then
+    if g.runner == "steam" then
+      cp = steamCoverDir .. "/" .. g.id .. ".jpg"
+    elseif g.runner == "heroic" then
+      cp = heroicCoverDir .. "/" .. g.id .. ".jpg"
+    end
+  end
+  return cp
+end
+
+local function coverFileExists(path)
+  if not path then return false end
+  local hit = coverExists[path]
+  if hit == nil then
+    hit = noctalia.fileExists(path)
+    coverExists[path] = hit
+  end
+  return hit
+end
+
+-- ---------------------------------------------------------------------------
+-- Apertura de la caja (jukebox-open): al pulsar un juego, la tapa -que es la
+-- propia portada- gira sobre la bisagra izquierda hasta quedar de canto,
+-- aparece la bandeja y el disco (la carátula recortada en círculo) gira
+-- mientras arranca el juego. La UI no sabe rotar, así que el disco se sirve
+-- como fotogramas pre-rotados con ImageMagick, generados la primera vez.
+-- ---------------------------------------------------------------------------
+
+local DISC_FRAMES = 24        -- 360 / 24 = 15° por fotograma
+local DISC_MS_PER_FRAME = 50  -- 24 fotogramas = 1,2 s por vuelta
+local LID_MS = 620            -- lo que tarda la tapa en abrirse
+local LAUNCH_MS = 2150        -- apertura + giro antes de lanzar el juego
+
+local launchingId = nil        -- id que se va a lanzar (puede ser una variante)
+local launchingCaseId = nil    -- id de la fila cuya caja se abre (normalmente la base)
+local launchElapsed = 0
+local launchLid = 0
+local launchRenderAcc = 0
+local discReady = {}          -- id -> los fotogramas ya existen
+local discPending = {}        -- id -> se están generando
+
+local function discDirFor(id)
+  return discCacheDir .. "/" .. id
+end
+
+local function discFramePath(id, index)
+  return discDirFor(id) .. "/f" .. index .. ".png"
+end
+
+local function discFramesReady(id)
+  if discReady[id] then return true end
+  if noctalia.fileExists(discFramePath(id, DISC_FRAMES - 1)) then
+    discReady[id] = true
+    return true
+  end
+  return false
+end
+
+-- El script se escribe una vez en la caché y se reutiliza: pasar el ángulo
+-- como argumento desde Luau obligaría a escapar comillas dentro de comillas.
+local DISC_SCRIPT = [==[
+# Fotogramas pre-rotados del disco de un juego.
+# $1 = carátula (puede no existir)   $2 = carpeta de salida
+cover="$1"
+out="$2"
+mkdir -p "$out" || exit 1
+
+# Marca de con qué portada se generó este disco: si cambia, el plugin tira
+# los fotogramas y los vuelve a hacer.
+printf '%s' "$cover" > "$out/src"
+
+if [ ! -f "$out/base.png" ]; then
+  if [ -n "$cover" ] && [ -f "$cover" ]; then
+    magick "$cover" -resize "256x256^" -gravity center -extent 256x256 \
+      \( -size 256x256 xc:black -fill white -draw "circle 128,128 128,6" \) \
+      -alpha off -compose CopyOpacity -composite \
+      -fill none -stroke "rgba(255,255,255,0.85)" -strokewidth 3 -draw "circle 128,128 124,128" \
+      -fill none -stroke "rgba(0,0,0,0.30)" -strokewidth 2 -draw "circle 128,128 112,128" \
+      -stroke none -fill "#080a0d" -draw "circle 128,128 128,116" \
+      "$out/base.png" || exit 1
+  else
+    magick -size 256x256 xc:none \
+      -fill "#1b2028" -stroke "rgba(255,255,255,0.45)" -strokewidth 2 \
+      -draw "circle 128,128 128,6" \
+      -stroke none -fill "#080a0d" -draw "circle 128,128 128,116" \
+      "$out/base.png" || exit 1
+  fi
+fi
+
+i=0
+while [ "$i" -lt 24 ]; do
+  if [ ! -f "$out/f$i.png" ]; then
+    magick "$out/base.png" -background none -rotate $((i * 15)) \
+      -gravity center -extent 256x256 "$out/f$i.png" || exit 1
+  fi
+  i=$((i + 1))
+done
+]==]
+
+local function ensureDiscScript()
+  local path = discCacheDir .. "/make-disc.sh"
+  if noctalia.fileExists(path) and noctalia.readFile(path) == DISC_SCRIPT then
+    return path
+  end
+  pcall(noctalia.writeFile, path, DISC_SCRIPT)
+  return path
+end
+
+prepareDisc = function(g, force)
+  if not g then return end
+  local dir = discDirFor(g.id)
+  local cover = coverFor(g) or ""
+
+  -- El disco apunta en "$dir/src" con qué portada se hizo. Si la portada ha
+  -- cambiado (o no hay marca) los fotogramas viejos ya no valen.
+  if not force and discFramesReady(g.id) then
+    local stamp = nil
+    pcall(function() stamp = noctalia.readFile(dir .. "/src") end)
+    if stamp ~= cover then force = true end
+  end
+
+  if force then
+    discReady[g.id] = nil
+    discPending[g.id] = nil
+  elseif discPending[g.id] or discFramesReady(g.id) then
+    return
+  end
+  if discPending[g.id] then return end
+
+  discPending[g.id] = true
+  pcall(noctalia.mkdirAll, dir)
+  local prefix = ""
+  if force then prefix = "rm -rf " .. shellQuote(dir) .. " && " end
+  local cmd = prefix .. "sh " .. shellQuote(ensureDiscScript()) .. " " .. shellQuote(cover) .. " " .. shellQuote(dir)
+  local ok = noctalia.runAsync(cmd, function(res)
+    discPending[g.id] = nil
+    if res and res.exitCode == 0 and noctalia.fileExists(discFramePath(g.id, DISC_FRAMES - 1)) then
+      discReady[g.id] = true
+    else
+      noctalia.log("disc: no se pudo generar el disco de " .. tostring(g.id)
+        .. ": " .. tostring(res and (res.stderr or res.stdout) or "?"):sub(1, 200))
+    end
+  end)
+  if not ok then
+    discPending[g.id] = nil
+    noctalia.log("disc: no se pudo arrancar make-disc.sh")
+  end
+end
+
+-- El disco tal cual: fotograma girando si ya está cacheado, disco quieto
+-- mientras se genera y, como último recurso, un círculo vacío.
+local function renderDisc(g, size)
+  local s = math.max(16, math.floor(size))
+  local id = g.id
+  if discFramesReady(id) then
+    local frame = math.floor(launchElapsed / DISC_MS_PER_FRAME) % DISC_FRAMES
+    return ui.image({
+      path = discFramePath(id, frame),
+      width = s,
+      height = s,
+      fit = "contain",
+    })
+  end
+  local base = discDirFor(id) .. "/base.png"
+  if noctalia.fileExists(base) then
+    return ui.image({ path = base, width = s, height = s, fit = "contain" })
+  end
+  return ui.column({
+    width = s,
+    height = s,
+    radius = math.floor(s / 2),
+    fill = "#1b2028",
+    border = "outline/0.6",
+    borderWidth = 1,
+    align = "center",
+    justify = "center",
+  }, {
+    ui.glyph({ name = "disc", size = math.floor(s * 0.45), color = "on_surface_variant" }),
+  })
+end
+
+-- La caja abierta: la tapa se estrecha hasta dejar sólo su canto y la
+-- bandeja, con el disco girando, ocupa el resto. El ancho total no cambia,
+-- así que la balda y el resto de la fila no se mueven.
+local function renderOpenCase(g, meta, cp, cw, ch)
+  local badge = gameBadge(g)
+  local p = launchLid
+  local lidW = math.max(4, math.floor(cw * (1 - 0.80 * p)))
+  local trayW = math.max(1, cw - lidW)
+  local bannerH = math.max(10, math.floor(ch * 0.075))
+
+  local lidChildren = {}
+  if lidW >= 14 then
+    local innerW = math.max(2, lidW - 4)
+    local innerH = math.max(2, ch - bannerH - 4)
+    local bannerChildren = {
+      badgeGlyph(badge, math.max(7, math.floor(bannerH * 0.6))),
+    }
+    if lidW >= 46 then
+      table.insert(bannerChildren, ui.label({
+        text = string.upper(badge.label or ""),
+        fontSize = math.max(6, math.floor(bannerH * 0.46)),
+        color = "on_surface",
+        maxLines = 1,
+      }))
+    end
+    local art
+    if cp and coverFileExists(cp) then
+      -- "stretch" y no "cover": al girar, la portada se estrecha (escorzo)
+      -- en vez de recortarse por el centro.
+      art = ui.image({ path = cp, width = innerW, height = innerH, fit = "stretch" })
+    else
+      art = ui.column({
+        width = innerW,
+        height = innerH,
+        fill = "surface_variant",
+        align = "center",
+        justify = "center",
+      }, {
+        ui.glyph({ name = meta.glyph, size = math.max(8, math.floor(lidW * 0.5)), color = meta.color }),
+      })
+    end
+    table.insert(lidChildren, ui.row({
+      height = bannerH,
+      fill = "#0d1117",
+      align = "center",
+      justify = "center",
+      gap = 3,
+    }, bannerChildren))
+    table.insert(lidChildren, art)
+  else
+    -- De canto: se ve el canto de plástico de la tapa.
+    table.insert(lidChildren, ui.box({
+      width = math.max(1, lidW - 4),
+      height = math.max(2, ch - 4),
+      radius = 1,
+      fill = "#151a22",
+    }))
+  end
+
+  local lid = ui.column({
+    width = lidW,
+    height = ch,
+    gap = 0,
+    radius = 4,
+    fill = "#0b0e12",
+    align = "center",
+    justify = "center",
+  }, lidChildren)
+
+  local trayChildren = {}
+  local pad = math.max(4, math.floor(trayW * 0.09))
+  local plateW = math.max(2, trayW - pad * 2 - 2)
+  local plateH = math.max(2, ch - pad * 2 - 2)
+  local discSize = math.min(plateW * 0.94, plateH * 0.94)
+  if trayW >= 40 and discSize >= 24 then
+    table.insert(trayChildren, ui.column({
+      width = plateW,
+      height = plateH,
+      fill = "#161c25",
+      radius = 3,
+      border = "outline/0.45",
+      borderWidth = 1,
+      align = "center",
+      justify = "center",
+    }, { renderDisc(g, discSize) }))
+  end
+
+  local tray = ui.column({
+    width = trayW,
+    height = ch,
+    fill = "#090c11",
+    radius = 3,
+    border = "outline/0.55",
+    borderWidth = 1,
+    align = "center",
+    justify = "center",
+    padding = pad,
+  }, trayChildren)
+
+  return ui.row({
+    width = cw,
+    height = ch,
+    gap = 0,
+    radius = 4,
+    border = "primary",
+    borderWidth = 2,
+  }, { lid, tray })
+end
+
+
+-- Caja cerrada (cabecera de plataforma + carátula) a un tamaño dado. La usan
+-- la estantería vertical y la fila horizontal del modo jukebox.
+local function renderCaseBox(g, meta, cp, cw, ch, focused)
+  local badge = gameBadge(g)
+  local bannerH = math.max(12, math.floor(ch * 0.085))
+  local innerW = cw - 4
+  local innerH = ch - bannerH - 4
+
+  local art
+  if cp and coverFileExists(cp) then
+    art = ui.image({
+      path = cp,
+      width = innerW,
+      height = innerH,
+      radius = 0,
+      fit = "cover",
+    })
+  else
+    art = ui.column({
+      width = innerW,
+      height = innerH,
+      fill = "surface_variant",
+      align = "center",
+      justify = "center",
+    }, {
+      ui.glyph({ name = meta.glyph, size = 22, color = meta.color }),
+    })
+  end
+
+  return ui.row({
+    width = cw,
+    height = ch,
+    gap = 0,
+    radius = 4,
+    fill = "#0b0e12",
+    border = focused and "primary" or "outline/0.55",
+    borderWidth = focused and 2 or 1,
+  }, {
+    ui.column({ flexGrow = 1, gap = 0 }, {
+      ui.row({
+        height = bannerH,
+        fill = "#0d1117",
+        align = "center",
+        justify = "center",
+        gap = 3,
+      }, {
+        badgeGlyph(badge, math.max(8, math.floor(bannerH * 0.62))),
+        ui.label({
+          text = string.upper(badge.label or ""),
+          fontSize = math.max(6, math.floor(bannerH * 0.46)),
+          color = "on_surface",
+          maxLines = 1,
+        }),
+      }),
+      art,
+    }),
+  })
+end
+
+local function renderGameRow(g, index)
+  local meta = runnerMeta[g.runner] or { glyph = "app-window", color = "on_surface_variant" }
+  local badge = gameBadge(g)
+  local launching = launchingId ~= nil
+  local isLaunching = launchingCaseId == g.id
+  local focus = focusedGame()
+  local focused = (focus ~= nil and focus.id == g.id) or isLaunching
+  local p = anim[g.id] or 0
+  local ch = math.floor(COVER_H * (1 + (COVER_GROW - 1) * p))
+  local cw = math.floor(ch * COVER_RATIO)
+  local cp = coverFor(g)
+
+  -- La caja: cabecera con la plataforma y carátula, como las cajas que
+  -- dibuja GameCase.qml en el repo. Al lanzar se sustituye por la caja
+  -- abierta: la tapa gira, la bandeja aparece y el disco gira.
+  local caseWidget
+  if isLaunching then
+    caseWidget = renderOpenCase(g, meta, cp, cw, ch)
+  else
+    caseWidget = renderCaseBox(g, meta, cp, cw, ch, focused)
+  end
+
+  local variants = expandableVariants(g)
+  -- Un título con varias formas de abrirse no lanza nada al pulsarlo: deja
+  -- ver sus opciones. Los demás juegos se abren con la caja abriéndose.
+  local function activate()
+    if launching then return end
+    if variants then
+      expandedId = g.id
+      render()
+    else
+      beginLaunch(g)
+    end
+  end
+
+  local info = {
+    badgeGlyph(badge, 12),
+    ui.label({ text = badge.label, fontSize = 11, color = "on_surface_variant" }),
+  }
+  if isLaunching then
+    info = {
+      ui.glyph({ name = "disc", size = 12, color = "primary" }),
+      ui.label({ text = "Abriendo…", fontSize = 11, color = "primary/0.9" }),
+    }
+  elseif variants then
+    table.insert(info, ui.label({
+      text = "· " .. (1 + #variants) .. " formas de abrir",
+      fontSize = 11,
+      color = "primary/0.9",
+    }))
+  end
+
+  -- Balda de cristal: canto iluminado y filo tenue debajo.
+  local shelf = ui.column({ width = cw + 54, align = "center", gap = 2 }, {
+    ui.box({
+      width = cw + 34,
+      height = 3,
+      radius = 2,
+      fill = focused and "primary" or "outline/0.55",
+    }),
+    ui.box({ width = cw + 54, height = 1, fill = "outline/0.28" }),
+  })
+
+  return ui.row({
+    key = g.id,
+    height = ROW_H - 6,
+    align = "center",
+    gap = 18,
+    paddingH = 14,
+    radius = 12,
+    fill = focused and "primary/0.10" or "primary/0",
+    border = "primary/0.35",
+    borderWidth = focused and 1 or 0,
+    opacity = isLaunching and 1 or (launching and 0.25 or (focused and 1 or (1 - 0.45 * dim))),
+    onHover = "onCardHover",
+    onClick = activate,
+  }, {
+    ui.column({ width = STAND_W, align = "center", justify = "center", gap = 3 }, { caseWidget, shelf }),
+    ui.column({ flexGrow = 1, justify = "center", gap = 5 }, {
+      ui.label({
+        text = g.name,
+        fontWeight = "bold",
+        fontSize = focused and 20 or 16,
+        maxLines = 2,
+        color = focused and "on_surface" or "on_surface_variant",
+      }),
+      ui.row({ align = "center", gap = 6 }, info),
+      -- Opciones del juego: dentro de la propia fila, al lado del juego (no en
+      -- la parte baja del panel). Fuera del scroll, porque el pitch de las
+      -- filas no cambia.
+      (expandedId == g.id and renderLaunchOptions()) or ui.row({ flexGrow = 1 }),
+    }),
+    ui.row({
+      align = "center",
+      gap = 6,
+      paddingH = 12,
+      paddingV = 7,
+      radius = 8,
+      fill = focused and "primary" or "surface_variant/0.7",
+    }, {
+      ui.glyph({
+        name = isLaunching and "disc" or (variants and "adjustments" or "player-play"),
+        size = 14,
+        color = focused and "on_primary" or "on_surface_variant",
+      }),
+      ui.label({
+        text = isLaunching and "Abriendo…" or (variants and "Opciones" or "Jugar"),
+        fontSize = 12,
+        fontWeight = "bold",
+        color = focused and "on_primary" or "on_surface_variant",
+      }),
+    }),
+  })
+end
+
+local function renderGameList()
+  clampSelection()
+  local rows = {}
+  for i = 1, #filtered do
+    table.insert(rows, renderGameRow(filtered[i], i))
+  end
+  return rows
+end
+
+-- ---------------------------------------------------------------------------
+-- Vista horizontal (jukebox)
+--
+-- ui.scroll solo desplaza en vertical, así que en lugar de una fila enorme
+-- que se desplace se enseña una ventana de JUKEBOX_VISIBLE cajas alrededor de
+-- la seleccionada. Al mover la selección la ventana se recentra sola, igual
+-- que el carrusel del repo NonDot GameLibrary. Las cajas conservan su
+-- carátula, la cabecera de plataforma, el crecimiento al pasar el ratón y la
+-- apertura de disco al lanzar.
+-- ---------------------------------------------------------------------------
+
+local function jukeboxRange()
+  local n = #filtered
+  if n == 0 then return 0, 0 end
+  local first = selectedIndex + 1 - math.floor(JUKEBOX_VISIBLE / 2)
+  if first < 1 then first = 1 end
+  local last = first + JUKEBOX_VISIBLE - 1
+  if last > n then
+    last = n
+    first = math.max(1, last - JUKEBOX_VISIBLE + 1)
+  end
+  return first, last
+end
+
+local function moveJukebox(step)
+  if activeTab ~= TAB_GAMES or #filtered == 0 then return end
+  selectedIndex = selectedIndex + step
+  if selectedIndex < 0 then selectedIndex = #filtered - 1 end
+  if selectedIndex >= #filtered then selectedIndex = 0 end
+  -- Las opciones abiertas eran de otro juego y el cursor ya no está encima.
+  expandedId = nil
+  optionIndex = 0
+  hoveredId = nil
+  ensureTicks(true)
+  render()
+end
+
+local function renderJukeboxCard(g, index)
+  local meta = runnerMeta[g.runner] or { glyph = "app-window", color = "on_surface_variant" }
+  local launching = launchingId ~= nil
+  local isLaunching = launchingCaseId == g.id
+  local focus = focusedGame()
+  local focused = (focus ~= nil and focus.id == g.id) or isLaunching
+  local p = anim[g.id] or 0
+  local ch = math.floor(JUKEBOX_BASE_H * (1 + (COVER_GROW - 1) * p))
+  local cw = math.floor(ch * COVER_RATIO)
+  local cp = coverFor(g)
+  local variants = expandableVariants(g)
+
+  local caseWidget
+  if isLaunching then
+    caseWidget = renderOpenCase(g, meta, cp, cw, ch)
+  else
+    caseWidget = renderCaseBox(g, meta, cp, cw, ch, focused)
+  end
+
+  local function activate()
+    if launching then return end
+    -- En el carrusel, pulsar una caja que no está seleccionada la trae al
+    -- centro; pulsar la seleccionada la abre (o muestra sus opciones).
+    if index ~= selectedIndex then
+      selectedIndex = index
+      expandedId = nil
+      optionIndex = 0
+      hoveredId = nil
+      ensureTicks(true)
+      render()
+      return
+    end
+    if variants then
+      expandedId = g.id
+      optionIndex = 0
+      render()
+    else
+      beginLaunch(g)
+    end
+  end
+
+  return ui.column({
+    key = g.id,
+    align = "center",
+    justify = "center",
+    gap = 4,
+    paddingH = 4,
+    paddingV = 4,
+    radius = 12,
+    fill = focused and "primary/0.10" or "primary/0",
+    border = "primary/0.35",
+    borderWidth = focused and 1 or 0,
+    opacity = isLaunching and 1 or (launching and 0.25 or (focused and 1 or (1 - 0.45 * dim))),
+    onHover = "onCardHover",
+    onClick = activate,
+  }, {
+    caseWidget,
+    -- Balda de cristal, igual que en la vista vertical.
+    ui.column({ width = cw + 18, align = "center", gap = 2 }, {
+      ui.box({
+        width = cw + 10,
+        height = 3,
+        radius = 2,
+        fill = focused and "primary" or "outline/0.55",
+      }),
+      ui.box({ width = cw + 18, height = 1, fill = "outline/0.28" }),
+    }),
+    ui.label({
+      text = g.name,
+      fontSize = focused and 13 or 11,
+      fontWeight = focused and "bold" or nil,
+      color = focused and "on_surface" or "on_surface_variant",
+      maxLines = 1,
+    }),
+  })
+end
+
+local function renderJukeboxDetails()
+  local g = filtered[selectedIndex + 1]
+  if not g then return ui.row() end
+  local badge = gameBadge(g)
+  local variants = expandableVariants(g)
+  local launching = launchingId ~= nil
+  local isLaunching = launchingCaseId == g.id
+
+  local info = {
+    badgeGlyph(badge, 14),
+    ui.label({ text = badge.label, fontSize = 11, color = "on_surface_variant" }),
+  }
+  if isLaunching then
+    info = {
+      ui.glyph({ name = "disc", size = 14, color = "primary" }),
+      ui.label({ text = "Abriendo…", fontSize = 12, color = "primary/0.9" }),
+    }
+  elseif variants then
+    table.insert(info, ui.label({
+      text = "· " .. (1 + #variants) .. " formas de abrir",
+      fontSize = 11,
+      color = "primary/0.9",
+    }))
+  end
+
+  local buttons = {
+    ui.button({
+      text = isLaunching and "Abriendo…" or "Jugar",
+      glyph = isLaunching and "disc" or "player-play",
+      variant = "primary",
+      onClick = function()
+        if not launching then beginLaunch(g) end
+      end,
+    }),
+  }
+  if variants then
+    table.insert(buttons, ui.button({
+      text = "Opciones",
+      glyph = "adjustments",
+      variant = "outline",
+      onClick = function()
+        expandedId = g.id
+        optionIndex = 0
+        render()
+      end,
+    }))
+  end
+
+  return ui.column({ align = "center", gap = 6 }, {
+    ui.label({
+      text = g.name,
+      fontSize = 20,
+      fontWeight = "bold",
+      color = "on_surface",
+      maxLines = 1,
+    }),
+    ui.row({ align = "center", gap = 6 }, info),
+    ui.row({ align = "center", gap = 8 }, buttons),
+    (expandedId == g.id and renderLaunchOptions()) or ui.row(),
+  })
+end
+
+local function renderJukebox()
+  local first, last = jukeboxRange()
+  local cards = {}
+  for i = first, last do
+    table.insert(cards, renderJukeboxCard(filtered[i], i - 1))
+  end
+
+  local strip = ui.row({ align = "center", justify = "center", gap = 10, flexGrow = 1 }, {
+    ui.button({
+      glyph = "arrow-left",
+      variant = "ghost",
+      controlSize = "md",
+      tooltip = "Anterior",
+      onClick = function() moveJukebox(-1) end,
+    }),
+    ui.row({ align = "center", justify = "center", gap = 12, flexGrow = 1 }, cards),
+    ui.button({
+      glyph = "arrow-right",
+      variant = "ghost",
+      controlSize = "md",
+      tooltip = "Siguiente",
+      onClick = function() moveJukebox(1) end,
+    }),
+  })
+
+  local stripH = math.floor(JUKEBOX_BASE_H * COVER_GROW) + 66
+  return ui.column({ flexGrow = 1, gap = 8 }, {
+    ui.column({
+      height = stripH,
+      flexGrow = 0,
+      justify = "center",
+      padding = 10,
+      fill = "surface_variant/0.28",
+      radius = 18,
+      border = "outline/0.45",
+      borderWidth = 1,
+    }, { strip }),
+    renderJukeboxDetails(),
+  })
+end
+
+local function renderBody(content)
+  if loading then
+    return ui.label({ text = "Scanning for games…", color = "on_surface_variant" })
+  end
+  if errorMsg ~= "" then
+    return ui.column({ align = "center", justify = "center", gap = 12 }, {
+      ui.glyph({ name = "alert-circle", size = 40, color = "error" }),
+      ui.label({ text = errorMsg, color = "error", maxWidth = 400, textAlign = "center" }),
+      ui.button({ text = "Retry", variant = "primary", onClick = "onRescan" }),
+    })
+  end
+  if #filtered == 0 then
+    return ui.label({
+      text = #games == 0 and "No games found. Click the reload button to scan." or "No games match your search.",
+      color = "on_surface_variant",
+    })
+  end
+  return content
+end
+
+switchTab = function(id)
+  if activeTab == id then return end
+  -- Salir de "Añadir juego" descarta el .exe y el nombre a medio elegir.
+  if activeTab == TAB_ADD then
+    addExePath = nil
+    addName = ""
+  end
+  activeTab = id
+  -- The input is uncontrolled, so the field only empties when its key
+  -- changes - which this does, since the key carries the tab.
+  searchText = ""
+  selectedIndex = 0
+  browseIndex = 0
+  expandedId = nil
+  optionIndex = 0
+  filterGames(searchText)
+  if id == TAB_GAMES then
+    revealSelected()
+  else
+    revealBrowse()
+  end
+  if (id == TAB_BROWSE or id == TAB_ADD) and browsePath == "" then
+    loadBrowseDir(homeDir())
+    return
+  end
+  render()
+end
+
+-- Tabs en el orden visible (Juegos, Examinar, Añadir juego). El mando usa
+-- L/R y el D-pad horizontal para recorrerlos.
+local TAB_ORDER = { TAB_GAMES, TAB_BROWSE, TAB_ADD }
+
+function cycleTab(step)
+  local idx = 1
+  for i, id in ipairs(TAB_ORDER) do
+    if id == activeTab then idx = i end
+  end
+  idx = ((idx - 1 + step) % #TAB_ORDER) + 1
+  switchTab(TAB_ORDER[idx])
+end
+
+local function toggleViewMode()
+  viewMode = (viewMode == "shelf") and "jukebox" or "shelf"
+  if viewMode == "jukebox" then resetJukeboxScroll() end
+  hoveredId = nil
+  expandedId = nil
+  optionIndex = 0
+  ensureTicks(true)
+  render()
+end
+
+local function renderTabs()
+  local function tab(id, label, glyphName)
+    return ui.button({
+      key = "tab_" .. id,
+      text = label,
+      glyph = glyphName,
+      variant = activeTab == id and "primary" or "ghost",
+      controlSize = "sm",
+      onClick = function() switchTab(id) end,
+    })
+  end
+  -- Icono igual al de la lista: el glifo y el color del runner (Steam azul,
+  -- Heroic violeta, Faugus rosa), como el que aparece en la cabecera de cada
+  -- caja de juego.
+  local function shortcut(s)
+    -- ui.box no dibuja sus hijos; ui.row sí (como la cabecera de cada caja).
+    return ui.row({
+      width = 26,
+      height = 26,
+      radius = 6,
+      fill = "surface_variant",
+      border = "outline/0.4",
+      borderWidth = 1,
+      align = "center",
+      justify = "center",
+      onClick = function() launchShortcut(s) end,
+    }, {
+      ui.glyph({ name = s.glyph or "app-window", size = 15, color = s.color or "on_surface_variant" }),
+    })
+  end
+  local items = {
+    tab(TAB_GAMES, "Juegos", "device-gamepad-2"),
+    tab(TAB_BROWSE, "Examinar", "folder-open"),
+  }
+  local shortcuts = {}
+  for _, s in ipairs(launcherShortcuts) do
+    if launcherShortcutAvailable(s) then table.insert(shortcuts, shortcut(s)) end
+  end
+  if #shortcuts > 0 then
+    table.insert(items, ui.box({ width = 1, height = 18, fill = "outline/0.4" }))
+    for _, item in ipairs(shortcuts) do table.insert(items, item) end
+  end
+  table.insert(items, ui.spacer({ flexGrow = 1 }))
+  -- Alterna entre la estantería vertical y la fila horizontal (jukebox).
+  if activeTab == TAB_GAMES then
+    table.insert(items, ui.button({
+      key = "view_toggle",
+      text = viewMode == "shelf" and "Horizontal" or "Vertical",
+      glyph = viewMode == "shelf" and "arrows-horizontal" or "arrows-vertical",
+      variant = "ghost",
+      controlSize = "sm",
+      tooltip = viewMode == "shelf" and "Cambiar a vista horizontal" or "Cambiar a vista vertical",
+      onClick = function() toggleViewMode() end,
+    }))
+  end
+  -- Donde antes estaba el contador: añadir un .exe desde el disco. Al
+  -- elegirlo se suma a la vitrina y se abre con Faugus.
+  table.insert(items, tab(TAB_ADD, "Añadir juego", "plus"))
+  return ui.row({ align = "center", gap = 6 }, items)
+end
+
+local function renderBrowseHeader()
+  local title = browseDisks and "Discos" or browsePath
+  return ui.row({ align = "center", gap = 6 }, {
+    ui.button({
+      glyph = "arrow-left", variant = "ghost", controlSize = "sm", tooltip = "Volver",
+      onClick = function() backToFolder() end,
+    }),
+    ui.button({
+      glyph = "home", variant = "ghost", controlSize = "sm", tooltip = "Carpeta personal",
+      onClick = function() loadBrowseDir(homeDir()) end,
+    }),
+    ui.label({ text = title, fontSize = 12, color = "on_surface_variant", flexGrow = 1, maxLines = 1 }),
+    ui.button({
+      text = "Discos", glyph = "disc", controlSize = "sm",
+      variant = browseDisks and "primary" or "outline",
+      onClick = function() loadBrowseDisks() end,
+    }),
+  })
+end
+
+local function renderBrowseRow(entry, index)
+  local isSelected = index == browseIndex
+  local glyphName = browseDisks and "disc" or (entry.isDir and "folder" or "file")
+  local text = entry.name
+  if browseDisks and entry.detail and #entry.detail > 0 then
+    text = text .. "   ·   " .. entry.detail
+  end
+  local children = {
+    ui.glyph({ name = glyphName, size = 20, color = isSelected and "primary" or "on_surface_variant" }),
+    ui.label({
+      text = text,
+      fontSize = 13,
+      flexGrow = 1,
+      maxLines = 1,
+      fontWeight = isSelected and "bold" or nil,
+    }),
+  }
+  if not browseDisks and not entry.isDir then
+    table.insert(children, ui.glyph({ name = "player-play", size = 16, color = "primary" }))
+  end
+  -- height is pinned: renderBrowseBody turns a scroll offset back into an
+  -- index with BROWSE_ROW_H, and that only works on a fixed pitch
+  -- (38px row + the scroll container's 6px gap = BROWSE_ROW_H).
+  return ui.row({
+    key = "browse_" .. index,
+    height = 38,
+    align = "center",
+    gap = 10,
+    paddingH = 10,
+    radius = 6,
+    fill = isSelected and "primary/0.16" or "primary/0",
+    onClick = function() browseActivate(entry) end,
+  }, children)
+end
+
+local function renderBrowseBody()
+  if browseLoading then
+    return ui.row({ align = "center", justify = "center", flexGrow = 1 }, {
+      ui.label({ text = "Leyendo discos…", color = "on_surface_variant" }),
+    })
+  end
+  if browseError ~= "" then
+    return ui.column({ align = "center", justify = "center", flexGrow = 1, gap = 12 }, {
+      ui.glyph({ name = "alert-circle", size = 36, color = "error" }),
+      ui.label({ text = browseError, color = "error", maxWidth = 420, textAlign = "center" }),
+      ui.button({ text = "Reintentar", variant = "primary", onClick = function()
+        if browseDisks then
+          loadBrowseDisks()
+        else
+          loadBrowseDir(browsePath)
+        end
+      end }),
+    })
+  end
+  if #browseFiltered == 0 then
+    local empty = "No hay carpetas ni archivos .exe aquí."
+    if browseDisks then empty = "No hay discos extraíbles montados." end
+    if searchText ~= "" then empty = "Nada coincide con \"" .. searchText .. "\"." end
+    return ui.row({ align = "center", justify = "center", flexGrow = 1 }, {
+      ui.label({ text = empty, color = "on_surface_variant", maxWidth = 420, textAlign = "center" }),
+    })
+  end
+  local rows = {}
+  for i, entry in ipairs(browseFiltered) do
+    table.insert(rows, renderBrowseRow(entry, i - 1))
+  end
+  return ui.scroll({
+    key = "gl-browse-scroll",
+    flexGrow = 1,
+    gap = 6,
+    revealKey = revealKey,
+    onScroll = function(offset, _maxOffset)
+      local idx = math.floor((tonumber(offset) or 0) / BROWSE_ROW_H)
+      if idx < 0 then idx = 0 end
+      if idx > #browseFiltered - 1 then idx = #browseFiltered - 1 end
+      if idx ~= browseIndex then
+        browseIndex = idx
+        render()
+      end
+    end,
+  }, rows)
+end
+
+-- Paso 2 de "Añadir juego": nombre del juego. Se usa como título de la caja
+-- y como búsqueda de la portada en la tienda de Steam.
+local function renderAddNameForm()
+  return ui.column({
+    flexGrow = 1,
+    gap = 12,
+    padding = 16,
+    fill = "surface_variant/0.28",
+    radius = 18,
+    border = "outline/0.45",
+    borderWidth = 1,
+  }, {
+    ui.row({ align = "center", gap = 8 }, {
+      ui.glyph({ name = "plus", size = 18, color = "primary" }),
+      ui.label({ text = "Añadir juego", fontSize = 16, fontWeight = "bold", flexGrow = 1 }),
+      ui.button({
+        glyph = "x", variant = "ghost", controlSize = "sm", tooltip = "Cancelar",
+        onClick = function() cancelAddGame() end,
+      }),
+    }),
+    ui.column({ gap = 4 }, {
+      ui.label({ text = "Ejecutable elegido", fontSize = 11, color = "on_surface_variant" }),
+      ui.label({ text = addExePath or "", fontSize = 12, maxLines = 2 }),
+    }),
+    ui.column({ gap = 5 }, {
+      ui.label({
+        text = "Nombre del juego (se usa para buscar la portada)",
+        fontSize = 11,
+        color = "on_surface_variant",
+      }),
+      ui.input({
+        key = "addname_" .. (addExePath or ""),
+        placeholder = "Ej. Uncharted 4: A Thief's End",
+        value = addName,
+        onChange = function(value) addName = value or "" end,
+        onSubmit = function() confirmAddGame() end,
+        focus = true,
+        flexGrow = 1,
+      }),
+    }),
+    ui.row({ align = "center", gap = 8 }, {
+      ui.button({
+        text = "Añadir y abrir con Faugus",
+        glyph = "plus",
+        variant = "primary",
+        onClick = function() confirmAddGame() end,
+      }),
+      ui.button({
+        text = "Volver",
+        glyph = "arrow-left",
+        variant = "ghost",
+        onClick = function() cancelAddGame() end,
+      }),
+    }),
+  })
+end
+
+render = function()
+  local ok, err = pcall(function()
+    local body, bodyWidget
+    if activeTab == TAB_BROWSE then
+      body = renderBrowseHeader()
+      bodyWidget = ui.column({ flexGrow = 1, gap = 6 }, {
+        body,
+        renderBrowseBody(),
+      })
+    elseif activeTab == TAB_ADD then
+      if addExePath then
+        bodyWidget = renderAddNameForm()
+      else
+        body = renderBrowseHeader()
+        bodyWidget = ui.column({ flexGrow = 1, gap = 6 }, {
+          body,
+          ui.row({ align = "center", gap = 8, paddingH = 2 }, {
+            ui.glyph({ name = "plus", size = 14, color = "primary" }),
+            ui.label({
+              text = "Elige el .exe del juego y luego escribe su nombre: con ese nombre se busca la portada.",
+              fontSize = 12,
+              color = "on_surface_variant",
+              flexGrow = 1,
+              maxLines = 2,
+            }),
+          }),
+          renderBrowseBody(),
+        })
+      end
+    else
+      local showJukebox = viewMode == "jukebox" and not loading and errorMsg == "" and #filtered > 0
+      if showJukebox then
+        bodyWidget = renderJukebox()
+      else
+        body = renderBody(renderGameList())
+        if loading or errorMsg ~= "" or #filtered == 0 then
+          bodyWidget = ui.column({ flexGrow = 1, gap = 6 }, body)
+        else
+          -- The wheel scrolls this container natively. onScroll maps the
+          -- resulting offset back onto the selection, so the highlighted row
+          -- follows the view and Return launches whatever is in front.
+          bodyWidget = ui.scroll({
+            key = "gl-games-scroll",
+            flexGrow = 1,
+            gap = 6,
+            padding = 10,
+            fill = "surface_variant/0.28",
+            radius = 18,
+            border = "outline/0.45",
+            borderWidth = 1,
+            revealKey = revealKey,
+            onScroll = function(offset, _maxOffset)
+              local idx = math.floor((tonumber(offset) or 0) / ROW_H)
+              if idx < 0 then idx = 0 end
+              if idx > #filtered - 1 then idx = #filtered - 1 end
+              if idx ~= selectedIndex then
+                selectedIndex = idx
+                -- La rueda cambia de juego: las opciones abiertas eran de otro.
+                if expandedId then
+                  expandedId = nil
+                  optionIndex = 0
+                end
+                render()
+              end
+            end,
+          }, body)
+        end
+      end
+    end
+    -- Las opciones de lanzamiento se pintan dentro de la fila del juego que
+    -- las tiene expandidas (al lado del juego), no en una zona fija de abajo:
+    -- meterlas en el contenedor con scroll cambiaría la altura de paso que
+    -- usa la rueda para pasar de desplazamiento a selección.
+    -- En el paso del nombre no hay nada que buscar: la barra desaparece para
+    -- que el campo de texto sea el único foco.
+    local showSearch = not (activeTab == TAB_ADD and addExePath)
+    local head = { renderHeader(), renderTabs() }
+    if showSearch then table.insert(head, renderSearchBar()) end
+    local rootChildren = {
+      ui.column({ gap = 8 }, head),
+      bodyWidget,
+    }
+    panel.render(ui.column({ flexGrow = 1, gap = 8, padding = 12 }, rootChildren))
+    -- Se pide una sola vez: si quedara fijo, cada repintado de la animación
+    -- volvería a arrastrar la vista a la fila seleccionada.
+    revealKey = nil
+  end)
+  if not ok then
+    noctalia.log("render error: " .. tostring(err))
+  end
+end
+
+-- ---------------------------------------------------------------------------
+-- Animación de la estantería: el host entrega un tick por fotograma mientras
+-- el panel está abierto. Solo se pide mientras hay algo moviéndose, para no
+-- repintar la lista a 60 fps sin motivo.
+-- ---------------------------------------------------------------------------
+ensureTicks = function(on)
+  if ticking == on then return end
+  ticking = on
+  pcall(function() panel.setNeedsFrameTick(on) end)
+end
+
+-- True si el juego está en la lista visible (una variante plegada no lo
+-- está, y su caja no se puede abrir porque no tiene fila propia).
+local function visibleGame(id)
+  for _, g in ipairs(filtered) do
+    if g.id == id then return g end
+  end
+  return nil
+end
+
+-- Arranca la apertura de la caja. El juego se lanza de verdad cuando la
+-- animación termina; si el panel se cierra antes (Escape), onClose la
+-- cancela y no se lanza nada. caseId es la fila que se abre (la base); para
+-- un botón de opciones se pasa la base, así la caja que gira es la del juego
+-- que se va a ejecutar aunque sea "X (gamescope)".
+beginLaunch = function(g, caseId)
+  if launchingId or not g then return end
+  local cid = caseId or g.id
+  local caseGame = visibleGame(cid)
+  if not caseGame then caseGame = visibleGame(g.id) or g; cid = caseGame.id end
+  launchingId = g.id
+  launchingCaseId = cid
+  launchElapsed = 0
+  launchLid = 0
+  launchRenderAcc = 0
+  hoveredId = nil
+  expandedId = nil
+  optionIndex = 0
+  prepareDisc(caseGame)
+  ensureTicks(true)
+  render()
+end
+
+function onFrameTick(deltaMs)
+  local dt = tonumber(deltaMs) or 16
+
+  if launchingId then
+    -- La caja abierta manda: ni hover ni crecimiento mientras se lanza.
+    launchElapsed = launchElapsed + dt
+    -- Tapa: InOutCubic de 0 a 1 en LID_MS, como el NumberAnimation del repo.
+    local t = launchElapsed / LID_MS
+    if t > 1 then t = 1 end
+    if t < 0.5 then
+      launchLid = 4 * t * t * t
+    else
+      launchLid = 1 - ((-2 * t + 2) ^ 3) / 2
+    end
+    anim[launchingCaseId] = 1
+    if launchElapsed >= LAUNCH_MS then
+      local target = launchingId
+      launchingId = nil
+      launchingCaseId = nil
+      launchElapsed = 0
+      launchLid = 0
+      launchRenderAcc = 0
+      ensureTicks(false)
+      launchGame(target)
+      return
+    end
+    -- Repintar a ~30 fps: el host entrega un tick por fotograma y repintar
+    -- toda la lista a 100 fps triplica el coste sin que se note.
+    launchRenderAcc = launchRenderAcc + dt
+    if launchRenderAcc >= 32 then
+      launchRenderAcc = 0
+      render()
+    end
+    return
+  end
+
+  -- Suavizado exponencial: mismo resultado a 30 o a 144 fps.
+  local k = 1 - (0.001 ^ (dt / 220))
+  local focus = focusedGame()
+  local moving = false
+  for _, g in ipairs(filtered) do
+    local target = (focus and focus.id == g.id) and 1 or 0
+    local v = anim[g.id] or 0
+    if math.abs(target - v) > 0.004 then
+      v = v + (target - v) * k
+      if math.abs(target - v) < 0.005 then v = target end
+      anim[g.id] = v
+      moving = true
+    else
+      anim[g.id] = target
+    end
+  end
+  local dimTarget = hoveredId and 1 or 0
+  if math.abs(dimTarget - dim) > 0.01 then
+    dim = dim + (dimTarget - dim) * k
+    moving = true
+  else
+    dim = dimTarget
+  end
+  if moving then render() end
+end
+
+-- Hover de una caja: crece ella y las demás se atenúan. No mueve la
+-- selección: el cursor suele quedar sobre el panel y el hover se reevalúa
+-- al repintar (la estantería animada cambia la geometría), así que pisaría
+-- la navegación con teclado o mando. La rueda y el teclado mandan.
+function onCardHover(state, key)
+  if launchingId then return end
+  if state == "true" then
+    if hoveredId == key then return end
+    hoveredId = key
+  else
+    if hoveredId ~= key then return end
+    hoveredId = nil
+  end
+  ensureTicks(true)
+  render()
+end
+
+local scanGames
+
+local function buildBinary()
+  if building then return end
+  building = true
+  loading = true
+  errorMsg = ""
+  render()
+  local cmd = buildCommand()
+  local ok = noctalia.runAsync(cmd, function(res)
+    building = false
+    if res.exitCode == 0 then
+      loading = false
+      markBuilt()
+      scanGames()
+    else
+      loading = false
+      errorMsg = "Failed to build gamelauncher. Install gcc. (exit " .. (res.exitCode or "?") .. ")"
+      noctalia.log("build failed (cmd: " .. cmd .. "): " .. (res.stderr or "no stderr"))
+      render()
+    end
+  end)
+  if not ok then
+    building = false
+    loading = false
+    errorMsg = "Failed to start build process"
+    render()
+  end
+end
+
+function scanGames()
+  if loading or building then return end
+  if not binaryReady() then
+    buildBinary()
+    return
+  end
+  loading = true
+  errorMsg = ""
+  scanCounter = scanCounter + 1
+  searchText = ""
+  render()
+  local flags = ""
+  if isRunnerEnabled("steam") then flags = flags .. " --steam" end
+  if isRunnerEnabled("lutris") then flags = flags .. " --lutris" end
+  if isRunnerEnabled("heroic") then flags = flags .. " --heroic" end
+  local ok = noctalia.runAsync(binary .. flags .. " --force", function(res)
+    local ok3, err3 = pcall(function()
+      loading = false
+      if res.exitCode == 0 and res.stdout and #res.stdout > 0 then
+        local parsed, err2 = noctalia.json.decode(res.stdout)
+        if parsed then
+          games = parsed
+          coverExists = {}
+          -- The scanner below only walks Steam, Lutris and Heroic, so
+          -- .desktop-only games have to be added by hand.
+          pcall(appendDesktopGames)
+          pcall(appendExternalGames)
+          pcall(noctalia.state.set, "games", games)
+          fetchMissingCovers()
+        else
+          errorMsg = "Failed to parse game list: " .. (err2 or "unknown error")
+          noctalia.log("parse error on stdout: " .. res.stdout:sub(1, 200))
+          games = {}
+        end
+      else
+        errorMsg = "Game scan failed (exit " .. (res.exitCode or "?") .. ")"
+        if res.stderr and #res.stderr > 0 then
+          errorMsg = errorMsg .. ": " .. res.stderr:sub(1, 200)
+        end
+        games = {}
+      end
+      selectedIndex = 0
+      filterGames(searchText)
+    end)
+    if not ok3 then
+      loading = false
+      errorMsg = "Scan error: " .. tostring(err3)
+      games = {}
+      filtered = games
+      selectedIndex = 0
+      noctalia.log("scan callback error: " .. tostring(err3))
+    end
+    render()
+  end)
+  if not ok then
+    loading = false
+    errorMsg = "Failed to start game scan"
+    render()
+  end
+end
+
+
+function onOpen(context)
+  noctalia.state.set("o_open", true)
+  selectedIndex = 0
+  hoveredId = nil
+  dim = 0
+  launchingId = nil
+  launchingCaseId = nil
+  launchElapsed = 0
+  launchLid = 0
+  launchRenderAcc = 0
+  filterGames(searchText)
+  render()
+  ensureTicks(true)
+  scanGames()
+end
+
+function onClose()
+  -- Cerrar el panel cancela un lanzamiento en curso: el juego solo arranca
+  -- al terminar la animación de apertura.
+  launchingId = nil
+  launchingCaseId = nil
+  launchElapsed = 0
+  launchLid = 0
+  launchRenderAcc = 0
+  ensureTicks(false)
+  panel.close()
+end
+
+function onRescan()
+  scanGames()
+end
+
+-- CLI hook, so the panel can be exercised without a pointer:
+--   noctalia msg plugin alexander/game-launcher:original all status
+--   noctalia msg plugin alexander/game-launcher:original all tab browse
+--   noctalia msg plugin alexander/game-launcher:original all dir /ruta
+--   noctalia msg plugin alexander/game-launcher:original all disks
+--   noctalia msg plugin alexander/game-launcher:original all back
+--   noctalia msg plugin alexander/game-launcher:original all launch "halo"
+--   noctalia msg plugin alexander/game-launcher:original all add /ruta/juego.exe
+--   noctalia msg plugin alexander/game-launcher:original all forget juego
+-- Añade el juego recién registrado a la vitrina y abre su caja. Es global a
+-- propósito: también lo usa el despachador de IPC, donde no conviene
+-- depender de locales compartidos del chunk.
+function launchAddedGame(g)
+  if not g then return end
+  switchTab(TAB_GAMES)
+  filterGames("")
+  beginLaunch(g)
+end
+
+-- Botones del paso de nombre de "Añadir juego".
+function confirmAddGame()
+  if not addExePath then return end
+  local g = addGameFromExe(addExePath, addName)
+  addExePath = nil
+  addName = ""
+  launchAddedGame(g)
+end
+
+function cancelAddGame()
+  addExePath = nil
+  addName = ""
+  render()
+end
+
+function onIpc(event, payload)
+  local arg = (type(payload) == "string") and payload or ""
+  if event == "shortcuts" then
+    -- Diagnóstico: qué accesos directos ve el panel y si su entrada existe.
+    for _, s in ipairs(launcherShortcuts) do
+      noctalia.log(string.format(
+        "game-launcher shortcut %s: disponible=%s desktop=%s icon=%s bin=%s",
+        s.id, tostring(launcherShortcutAvailable(s)),
+        tostring(s.desktop and noctalia.fileExists(s.desktop)),
+        tostring(s.icon and noctalia.fileExists(s.icon)),
+        tostring(s.bin)))
+    end
+  elseif event == "shortcut" then
+    -- Diagnóstico: abre por CLI el launcher indicado (steam, heroic…).
+    for _, s in ipairs(launcherShortcuts) do
+      if s.id == arg then
+        noctalia.log("game-launcher shortcut: abriendo " .. s.label)
+        launchShortcut(s)
+        return
+      end
+    end
+    noctalia.log("game-launcher shortcut: id desconocido [" .. arg .. "]")
+  elseif event == "tab" then
+    if arg == "browse" then
+      switchTab(TAB_BROWSE)
+    elseif arg == "add" then
+      switchTab(TAB_ADD)
+    else
+      switchTab(TAB_GAMES)
+    end
+  elseif event == "view" then
+    local v = tostring(arg):match("^%s*(.-)%s*$")
+    if v == "shelf" or v == "jukebox" then
+      viewMode = v
+      hoveredId = nil
+      expandedId = nil
+      optionIndex = 0
+      ensureTicks(true)
+      render()
+    else
+      toggleViewMode()
+    end
+  elseif event == "add" then
+    -- CLI: añade el .exe indicado y lo abre con Faugus. Admite
+    -- "/ruta/juego.exe|Nombre del juego" para fijar el nombre de la portada.
+    local exe, name = arg:match("^(.-)|(.*)$")
+    launchAddedGame(addGameFromExe(exe or arg, name))
+  elseif event == "pick" then
+    -- CLI: simula elegir un .exe en "Añadir juego" (abre el paso del nombre).
+    local exe, name = arg:match("^(.-)|(.*)$")
+    arg = exe or arg
+    if #arg > 0 then
+      activeTab = TAB_ADD
+      addExePath = arg
+      addName = (name and #name > 0) and name or nameForAdd(arg)
+      render()
+    end
+  elseif event == "forget" then
+    -- CLI: quita de la vitrina y del JSON un juego añadido (id o nombre).
+    local needle = arg:lower()
+    for i = #games, 1, -1 do
+      local g = games[i]
+      if g.runner == "external"
+        and (tostring(g.id):lower() == needle or tostring(g.name):lower() == needle) then
+        table.remove(games, i)
+      end
+    end
+    for i = #externalExtra, 1, -1 do
+      local g = externalExtra[i]
+      if tostring(g.id):lower() == needle or tostring(g.name):lower() == needle then
+        table.remove(externalExtra, i)
+      end
+    end
+    saveExternalExtra()
+    filterGames(searchText)
+    render()
+  elseif event == "dir" then
+    loadBrowseDir((#arg > 0) and arg or homeDir())
+  elseif event == "disks" then
+    loadBrowseDisks()
+  elseif event == "back" then
+    backToFolder()
+  elseif event == "search" then
+    onSearch(arg)
+  elseif event == "status" then
+    noctalia.log(string.format(
+      "game-launcher status: vista=%s tab=%s path=[%s] disks=%s entradas=%d visibles=%d browseSel=%d gameSel=%d err=[%s] juegos=%d filtrados=%d",
+      viewMode, activeTab, browsePath, tostring(browseDisks), #browseEntries, #browseFiltered,
+      browseIndex, selectedIndex, browseError, #games, #filtered))
+  elseif event == "names" then
+    -- Diagnóstico: lista los juegos realmente visibles (nombre[y runner])
+    local out = {}
+    for i, g in ipairs(filtered) do
+      if i > 25 then
+        table.insert(out, "…")
+        break
+      end
+      table.insert(out, string.format("%d:%s[%s]", i, tostring(g.name), tostring(g.runner)))
+    end
+    noctalia.log("game-launcher names: " .. table.concat(out, " | "))
+  elseif event == "launch" then
+    -- Diagnóstico: abre la caja y lanza, sin ratón. Con texto busca por
+    -- nombre; sin texto usa la fila seleccionada.
+    local target
+    if #arg == 0 then
+      target = filtered[selectedIndex + 1]
+    else
+      for _, g in ipairs(filtered) do
+        if tostring(g.name or ""):lower():find(arg:lower(), 1, true) then
+          target = g
+          break
+        end
+      end
+    end
+    if target then
+      noctalia.log("game-launcher launch: " .. tostring(target.name))
+      beginLaunch(target)
+    else
+      noctalia.log("game-launcher launch: sin objetivo para [" .. arg .. "]")
+    end
+  elseif event == "expand" then
+    -- Diagnóstico: despliega las opciones del primer juego cuyo nombre
+    -- contenga el texto (o las cierra si viene vacío).
+    expandedId = nil
+    if #arg > 0 then
+      for _, g in ipairs(games) do
+        if tostring(g.name or ""):lower():find(arg:lower(), 1, true) then
+          expandedId = g.id
+          local v = expandableVariants(g)
+          noctalia.log(string.format("game-launcher expand: %s [%s] opciones=%d",
+            tostring(g.name), tostring(g.runner), v and #v or 0))
+          break
+        end
+      end
+    else
+      noctalia.log("game-launcher expand: ninguno")
+    end
+    render()
+  elseif event == "nav" then
+    -- Mando (gamepad) o CLI: mueve la selección de la vitrina o de
+    -- "Examinar". Payload: up, down, left, right, enter, back, options,
+    -- pageup, pagedown.
+    if arg == "up" or arg == "prev" then
+      if expandedId then stepLaunchOption(-1) else onKey("Up", true) end
+    elseif arg == "down" or arg == "next" then
+      if expandedId then stepLaunchOption(1) else onKey("Down", true) end
+    elseif arg == "left" or arg == "tabprev" or arg == "tab_prev" then
+      if expandedId then stepLaunchOption(-1) else cycleTab(-1) end
+    elseif arg == "right" or arg == "tabnext" or arg == "tab_next" then
+      if expandedId then stepLaunchOption(1) else cycleTab(1) end
+    elseif arg == "back" or arg == "b" then
+      -- Con las opciones abiertas, B las cierra; en "Examinar" sube de
+      -- carpeta; en el resto no hace nada.
+      if expandedId then closeLaunchOptions() else onKey("Left", true) end
+    elseif arg == "enter" or arg == "select" or arg == "a" then
+      if expandedId then confirmLaunchOption() else onKey("Return", true) end
+    elseif arg == "options" or arg == "y" then
+      if expandedId then closeLaunchOptions() else openLaunchOptions() end
+    elseif arg == "pageup" or arg == "prevpage" then
+      jumpRow(-PAGE_STEP)
+    elseif arg == "pagedown" or arg == "nextpage" then
+      jumpRow(PAGE_STEP)
+    end
+  end
+end
+
+function jumpRow(step)
+  -- Salta una página de filas (LT/RT o L1/R1 del mando).
+  if activeTab == TAB_BROWSE or activeTab == TAB_ADD then
+    if #browseFiltered == 0 then return end
+    browseIndex = browseIndex + step
+    if browseIndex < 0 then browseIndex = 0 end
+    if browseIndex >= #browseFiltered then browseIndex = #browseFiltered - 1 end
+    revealBrowse()
+    render()
+    return
+  end
+  if #filtered == 0 then return end
+  selectedIndex = selectedIndex + step
+  if selectedIndex < 0 then selectedIndex = 0 end
+  if selectedIndex >= #filtered then selectedIndex = #filtered - 1 end
+  ensureSelVisible()
+  revealSelected()
+  ensureTicks(true)
+  render()
+end
+
+
+function onSearch(value)
+  searchText = value or ""
+  if activeTab == TAB_BROWSE or activeTab == TAB_ADD then
+    browseIndex = 0
+    applyBrowseFilter()
+    revealBrowse()
+  else
+    selectedIndex = 0
+    filterGames(searchText)
+    revealSelected()
+  end
+  render()
+end
+
+function onSubmitSearch()
+  if activeTab == TAB_BROWSE or activeTab == TAB_ADD then
+    browseActivate(browseFiltered[browseIndex + 1])
+  elseif #filtered > 0 and selectedIndex >= 0 and selectedIndex < #filtered then
+    beginLaunch(filtered[selectedIndex + 1])
+  end
+end
+
+function onKey(chord, pressed)
+  if not pressed then return end
+
+  if activeTab == TAB_BROWSE or activeTab == TAB_ADD then
+    -- En el paso del nombre, las flechas y Enter son del campo de texto.
+    if activeTab == TAB_ADD and addExePath then return end
+    if chord == "Up" then
+      if #browseFiltered > 0 then
+        browseIndex = browseIndex - 1
+        if browseIndex < 0 then browseIndex = #browseFiltered - 1 end
+        revealBrowse()
+        render()
+      end
+    elseif chord == "Down" then
+      if #browseFiltered > 0 then
+        browseIndex = browseIndex + 1
+        if browseIndex >= #browseFiltered then browseIndex = 0 end
+        revealBrowse()
+        render()
+      end
+    elseif chord == "Left" then
+      backToFolder()
+    elseif chord == "Return" then
+      browseActivate(browseFiltered[browseIndex + 1])
+    end
+    return
+  end
+
+  -- Con las opciones abiertas, las flechas se mueven entre ellas en vez de
+  -- cambiar de fila: es lo que está enseñando el panel en ese momento.
+  if expandedId and (chord == "Up" or chord == "Down" or chord == "Left" or chord == "Right") then
+    stepLaunchOption((chord == "Down" or chord == "Right") and 1 or -1)
+    return
+  end
+
+  -- En la fila horizontal las cuatro flechas mueven el carrusel: la ventana
+  -- se recentra en la caja seleccionada. Return abre el juego del centro.
+  if viewMode == "jukebox" then
+    if chord == "Left" or chord == "Up" then
+      moveJukebox(-1)
+    elseif chord == "Right" or chord == "Down" then
+      moveJukebox(1)
+    elseif chord == "Return" then
+      if #filtered > 0 and selectedIndex >= 0 and selectedIndex < #filtered then
+        beginLaunch(filtered[selectedIndex + 1])
+      end
+    end
+    return
+  end
+
+  if chord == "Up" then
+    if #filtered > 0 then
+      selectedIndex = selectedIndex - 1
+      if selectedIndex < 0 then selectedIndex = #filtered - 1 end
+      ensureSelVisible()
+      revealSelected()
+      ensureTicks(true)
+      render()
+    end
+  elseif chord == "Down" then
+    if #filtered > 0 then
+      selectedIndex = selectedIndex + 1
+      if selectedIndex >= #filtered then selectedIndex = 0 end
+      ensureSelVisible()
+      revealSelected()
+      ensureTicks(true)
+      render()
+    end
+  elseif chord == "Return" then
+    if expandedId then
+      confirmLaunchOption()
+    elseif #filtered > 0 and selectedIndex >= 0 and selectedIndex < #filtered then
+      beginLaunch(filtered[selectedIndex + 1])
+    end
+  end
+end
+
+-- Rueda del ratón en la vista horizontal. Los paneles sí reciben onScroll
+-- (vertical), así que cada paso mueve el carrusel como las flechas. En la
+-- estantería vertical la rueda la gestiona el propio ui.scroll y este hook
+-- no hace nada.
+local lastScrollTime = 0
+function onScroll(axis, steps, _startsGesture)
+  pcall(function()
+    noctalia.log("game-launcher scroll: axis=" .. tostring(axis) .. " steps=" .. tostring(steps))
+  end)
+  if axis ~= "vertical" then return end
+  if activeTab ~= TAB_GAMES or viewMode ~= "jukebox" then return end
+  if #filtered == 0 then return end
+  local now = os.clock()
+  if now - lastScrollTime < 0.12 then return end
+  lastScrollTime = now
+  local n = tonumber(steps) or 0
+  if n > 0 then
+    moveJukebox(1)
+  elseif n < 0 then
+    moveJukebox(-1)
+  end
+end

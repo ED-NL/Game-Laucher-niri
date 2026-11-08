@@ -110,7 +110,7 @@ Si cambia el punto de montaje, hay que actualizar `GAME_DIR` en los `launch.sh` 
 ## Notas
 
 - Este repo es **local**: no tiene remoto ni se ha subido a ningún sitio.
-- `cache/disc/` contiene 21 discos con sus fotogramas (`base.png`, `f0..fN.png`) y
+- `cache/disc/` contiene 22 discos con sus fotogramas (`base.png`, `f0..fN.png`) y
   `make-disc.sh`; se restauran tal cual y el panel los reutiliza.
 - Las copias de seguridad de los estados anteriores están en
   `~/.local/state/noctalia/patches-backup/`.
