@@ -194,6 +194,48 @@ local function openLauncherPanel(panelId, context)
   pcall(function() noctalia.runAsync(cmd) end)
 end
 
+-- Última vista usada ("horizontal" o "vertical"). Se guarda en un archivo del
+-- directorio de datos del plugin para que sobreviva al cierre del panel y al
+-- reinicio de Noctalia. El atajo (tools/game-launcher-toggle.sh) lo lee para
+-- abrir la ventana correcta.
+local function layoutFilePath()
+  local ok, dir = pcall(noctalia.pluginDataDir)
+  if ok and dir and #dir > 0 then return dir .. "/last_layout" end
+  return nil
+end
+
+local function saveLastLayout(name)
+  local path = layoutFilePath()
+  if not path then return end
+  pcall(noctalia.writeFile, path, name)
+end
+
+local function loadLastLayout()
+  local path = layoutFilePath()
+  if not path or not noctalia.fileExists(path) then return nil end
+  local ok, text = pcall(noctalia.readFile, path)
+  if not ok or type(text) ~= "string" then return nil end
+  text = text:match("^%s*(.-)%s*$")
+  if text == "horizontal" or text == "vertical" then return text end
+  return nil
+end
+
+-- Pista que deja tools/game-launcher-toggle.sh justo antes de abrir un panel
+-- sin contexto: dice qué entrada ("horizontal" u "original") se va a abrir.
+-- Se lee una sola vez y se borra, para que no quede obsoleta.
+local function takeEntryHint()
+  local ok, dir = pcall(noctalia.pluginDataDir)
+  if not ok or not dir or #dir == 0 then return nil end
+  local path = dir .. "/open_entry"
+  if not noctalia.fileExists(path) then return nil end
+  local okr, text = pcall(noctalia.readFile, path)
+  pcall(noctalia.removeFile, path)
+  if not okr or type(text) ~= "string" then return nil end
+  text = text:match("^%s*(.-)%s*$")
+  if text == "horizontal" or text == "original" then return text end
+  return nil
+end
+
 local steamCoverDir = ""
 local heroicCoverDir = ""
 -- Fotogramas pre-rotados del disco que gira al abrir la caja. La UI
@@ -2419,52 +2461,66 @@ local function onJukeboxScroll(offset, _maxOffset)
   render()
 end
 
+-- Barra de desplazamiento horizontal del carrusel: una pista con un tramo por
+-- juego; el tramo del juego seleccionado se enciende y pulsar uno salta a ese
+-- juego. Sustituye a la barra vertical del ui.scroll (que además dejaba una
+-- franja negra debajo del carrusel).
+local function renderJukeboxScrollbar()
+  local n = #filtered
+  if n <= 1 then return ui.row() end
+  local trackW = 640
+  local segW = math.max(2, math.floor(trackW / n))
+  local segs = {}
+  for i = 1, n do
+    local idx = i - 1
+    table.insert(segs, ui.box({
+      key = "jb-seg-" .. i,
+      width = segW,
+      height = 6,
+      radius = 3,
+      fill = (idx == selectedIndex) and "primary" or "outline/0.35",
+      onClick = function()
+        if launchingId ~= nil or idx == selectedIndex then return end
+        selectedIndex = idx
+        expandedId = nil
+        optionIndex = 0
+        hoveredId = nil
+        ensureTicks(true)
+        render()
+      end,
+    }))
+  end
+  return ui.row({ align = "center", justify = "center", gap = 0, height = 14 }, segs)
+end
+
 -- Ventana apaisada: los datos del juego a la izquierda y el carrusel al lado,
--- no debajo. La ventana entera es horizontal (1240x640), así que la fila de
--- cajas respira y desaparece el hueco negro que dejaba la vista vertical.
--- El carrusel va dentro de un ui.scroll (espaciador guía) para que la rueda
--- del ratón funcione igual que las flechas aunque el panel no entregue el
--- hook global onScroll.
+-- no debajo. Ya no usa ui.scroll: la rueda del ratón llega por el hook global
+-- onScroll (más abajo) y la posición se ve en la barra horizontal inferior.
 local function renderJukeboxWide()
-  -- No se consume: el host lo reaplica cuando el hijo aparece, y así el panel
-  -- no se queda en negro si el primer render no tenía aún la fila de cajas.
-  local reveal = jbReveal
-  -- Alto de la fila de cajas (caja + balda + nombre) y del contenedor que la
-  -- recorta: así no quedan franjas negras arriba/abajo.
+  -- Alto de la fila de cajas (caja + balda + nombre) más la barra inferior.
   local stripH = math.floor(JUKEBOX_BASE_H * COVER_GROW) + 66
   return ui.row({ flexGrow = 1, gap = 14, align = "center" }, {
     ui.column({ width = 260, gap = 10, justify = "center" }, {
-      renderSearchBar(),
       renderJukeboxDetails(true),
     }),
     ui.column({
       flexGrow = 1,
       minWidth = 0,
-      height = stripH,
+      height = stripH + 26,
       paddingH = 18,
+      paddingV = 4,
+      gap = 6,
       fill = "surface_variant/0.28",
       radius = 18,
       border = "outline/0.45",
       borderWidth = 1,
       align = "stretch",
+      justify = "center",
     }, {
-      ui.scroll({
-        key = "jb-scroll",
-        flexGrow = 1,
-        fill = "surface_variant/0.28",
-        radius = 18,
-        revealKey = reveal,
-        onScroll = function(offset, maxOffset) onJukeboxScroll(offset, maxOffset) end,
-      }, {
-        ui.column({ gap = 0 }, {
-          ui.box({ height = jbGuideTop }),
-          ui.box({ height = JB_WIDE_TOP_GAP }),
-          ui.column({ key = JB_STRIP_KEY, justify = "center", minHeight = 1, minWidth = 0 }, {
-            renderJukeboxStrip(),
-          }),
-          ui.box({ height = 2000 }),
-        }),
+      ui.column({ key = JB_STRIP_KEY, justify = "center", minWidth = 0 }, {
+        renderJukeboxStrip(),
       }),
+      renderJukeboxScrollbar(),
     }),
   })
 end
@@ -2875,12 +2931,10 @@ render = function()
     local showSearch = not (activeTab == TAB_ADD and addExePath)
     local head
     if horizontalMode then
-      -- Todo en un renglón; en Juegos la búsqueda vive en la columna
-      -- izquierda, junto a los datos del juego.
+      -- Cabecera en un renglón y, justo debajo, la barra de búsqueda arriba
+      -- del todo (en todas las pestañas), no en medio de la columna de datos.
       head = { renderHorizontalHeader() }
-      if showSearch and activeTab ~= TAB_GAMES then
-        table.insert(head, renderSearchBar())
-      end
+      if showSearch then table.insert(head, renderSearchBar()) end
     else
       head = { renderHeader(), renderTabs() }
       if showSearch then table.insert(head, renderSearchBar()) end
@@ -3137,8 +3191,24 @@ function onOpen(context)
     local savedLayout = noctalia.state.get(STATE_LAYOUT)
     if type(savedLayout) == "string" then layout = savedLayout end
   end
+  -- Sin contexto (atajo Mod+Z): se abre la última vista con la que se cerró.
+  if type(layout) ~= "string" or #layout == 0 then
+    local entry = takeEntryHint()
+    if entry == "horizontal" then
+      layout = "horizontal"
+    elseif entry == "original" then
+      layout = "vertical"
+    elseif loadLastLayout() == "horizontal" then
+      -- Esta es la ventana vertical (atajo antiguo, sin script) y la última
+      -- vez se cerró en horizontal: se cambia a la ventana apaisada, igual
+      -- que hace el botón Horizontal, sin dibujar nada aquí.
+      openLauncherPanel("horizontal", "jukebox")
+      return
+    end
+  end
   pcall(noctalia.state.set, STATE_LAYOUT, "")
   horizontalMode = (layout == "jukebox" or layout == "horizontal")
+  saveLastLayout(horizontalMode and "horizontal" or "vertical")
   viewMode = horizontalMode and "jukebox" or "shelf"
   noctalia.state.set("o_open", true)
 
@@ -3185,6 +3255,7 @@ function onOpen(context)
 end
 
 function onClose()
+  pcall(takeEntryHint)
   -- Cerrar el panel cancela un lanzamiento en curso: el juego solo arranca
   -- al terminar la animación de apertura.
   rememberSelection()

@@ -60,6 +60,8 @@ mkdir -p "$APPLICATIONS" "$HOME/.local/bin"
 cp -a "$ROOT/config/applications/." "$APPLICATIONS/"
 cp -a "$ROOT/tools/reapply-noctalia-patches.sh" "$HOME/.local/bin/"
 chmod +x "$HOME/.local/bin/reapply-noctalia-patches.sh"
+cp -a "$ROOT/tools/game-launcher-toggle.sh" "$HOME/.local/bin/game-launcher-toggle"
+chmod +x "$HOME/.local/bin/game-launcher-toggle"
 
 echo "[9/9] fijando parches en la fuente del plugin"
 if [[ -x "$HOME/.local/bin/reapply-noctalia-patches.sh" ]]; then
