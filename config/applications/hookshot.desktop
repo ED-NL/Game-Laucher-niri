@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=The Legend of Zelda Ocarina of Time
+Comment=The Legend of Zelda: Ocarina of Time, built from your copy
+Exec="/run/media/spawnenl/L/game/The Legend of Zelda Ocarina of Time/Hookshot/bin/hookshot"
+Path=/run/media/spawnenl/L/game/The Legend of Zelda Ocarina of Time/Hookshot
+Icon=/run/media/spawnenl/L/game/The Legend of Zelda Ocarina of Time/Hookshot/hookshot.png
+Categories=Game;
+Terminal=false
+StartupWMClass=io.github.NotRexed.Hookshot

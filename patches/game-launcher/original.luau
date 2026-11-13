@@ -67,38 +67,18 @@ local STATE_GAMES = "gl_games"
 -- contexto de panel-open: si el host no lo entrega, la ventana nueva sigue
 -- sabiendo si debe nacer horizontal o vertical.
 local STATE_LAYOUT = "gl_layout"
--- Rueda del ratón en el carrusel horizontal. Los paneles no siempre entregan
--- el hook global onScroll, así que el carrusel vive dentro de un ui.scroll.
--- El offset inicial lo fija un ancla diminuta (revealKey) que está fuera de
--- la vista a offset 0; a partir de ahí, el espaciador superior se ajusta a
--- cada paso para que las cajas queden siempre a la misma altura. El reveal se
--- mantiene hasta que el contenedor confirma el offset: si se borrara antes,
--- el panel podía quedarse en negro mostrando sólo el espaciador.
-local JB_REST_OFFSET = 650
--- Sin hueco: el viewport mide justo la fila, así no asoma fondo negro.
-local JB_WIDE_TOP_GAP = 0
 local JB_STRIP_KEY = "jb-strip"
-local jbGuideTop = JB_REST_OFFSET
-local jbLastOffset = JB_REST_OFFSET
-local jbReveal = JB_STRIP_KEY
-local jbScrollAccum = 0
-local jbInit = false
--- Los primeros onScroll vienen del revealKey/colocación inicial, no de la
--- rueda. Se ignoran durante un instante para que abrir el panel no cambie de
--- juego por sí solo.
-local jbIgnoreUntil = 0
-local jbOpenedAt = 0
+
+-- Deslizamiento suave del carrusel (como el SmoothedAnimation del scroll de
+-- NonDot GameLibrary): al cambiar de juego, la ventana de cajas se recentra y
+-- las cajas se dibujan desplazadas un paso hacia donde estaban; onFrameTick
+-- lo va llevando a 0. jbSlide está en px (positivo = desplazado a la derecha).
+local jbSlide = 0
+local jbPrevFirst = nil
 
 local function resetJukeboxScroll()
-  jbGuideTop = JB_REST_OFFSET
-  jbLastOffset = JB_REST_OFFSET
-  jbReveal = JB_STRIP_KEY
-  jbScrollAccum = 0
-  jbInit = false
-  local ok, now = pcall(noctalia.nowMs)
-  local ms = ok and tonumber(now) or 0
-  jbIgnoreUntil = ms + 700
-  jbOpenedAt = ms
+  jbSlide = 0
+  jbPrevFirst = nil
 end
 
 -- Forward-declared: the browse helpers below need to repaint before render()
@@ -651,6 +631,7 @@ local DESKTOP_GAMES = {
   "mortal-shell-2-gamescope",
   "ctr-nitro-fueled",
   "infamous-second-son",
+  "hookshot",
 }
 
 local function parseDesktopEntry(id)
@@ -1434,10 +1415,12 @@ end
 ---------------------------------------------------------------------------
 
 local PS4_LOGO = homeDir() .. "/.local/share/noctalia/game-platforms/ps4.png"
+local SWITCH_LOGO = homeDir() .. "/.local/share/noctalia/game-platforms/switch.png"
 
 local PLATFORM_BADGES = {
   ["ctr-nitro-fueled"] = { label = "PS4", icon = PS4_LOGO },
   ["infamous-second-son"] = { label = "PS4", icon = PS4_LOGO },
+  ["hookshot"] = { label = "Switch", icon = SWITCH_LOGO },
 }
 
 -- Cabecera de la caja de un juego: plataforma si la tiene, si no el runner.
@@ -1525,13 +1508,6 @@ local function renderLaunchOptions()
   if optionIndex < 0 or optionIndex > total - 1 then optionIndex = 0 end
 
   local buttons = {
-    ui.label({
-      text = target.name,
-      fontSize = 12,
-      fontWeight = "bold",
-      color = "on_surface_variant",
-      maxLines = 1,
-    }),
     ui.button({
       text = "Con " .. titleCase(runnerDisplayName(target.runner)),
       glyph = (runnerMeta[target.runner] or {}).glyph or "app-window",
@@ -1717,7 +1693,7 @@ end
 -- ---------------------------------------------------------------------------
 
 local DISC_FRAMES = 24        -- 360 / 24 = 15° por fotograma
-local DISC_MS_PER_FRAME = 50  -- 24 fotogramas = 1,2 s por vuelta
+local DISC_MS_PER_FRAME = 37  -- 24 fotogramas = ~0,9 s por vuelta, como el repo
 local LID_MS = 620            -- lo que tarda la tapa en abrirse
 local LAUNCH_MS = 2150        -- apertura + giro antes de lanzar el juego
 
@@ -1757,7 +1733,7 @@ mkdir -p "$out" || exit 1
 
 # Marca de con qué portada se generó este disco: si cambia, el plugin tira
 # los fotogramas y los vuelve a hacer.
-printf '%s' "$cover" > "$out/src"
+printf '%s|v2' "$cover" > "$out/src"
 
 if [ ! -f "$out/base.png" ]; then
   if [ -n "$cover" ] && [ -f "$cover" ]; then
@@ -1767,6 +1743,7 @@ if [ ! -f "$out/base.png" ]; then
       -fill none -stroke "rgba(255,255,255,0.85)" -strokewidth 3 -draw "circle 128,128 124,128" \
       -fill none -stroke "rgba(0,0,0,0.30)" -strokewidth 2 -draw "circle 128,128 112,128" \
       -stroke none -fill "#080a0d" -draw "circle 128,128 128,116" \
+      -fill "rgba(255,255,255,0.75)" -draw "circle 128,24 128,11" \
       "$out/base.png" || exit 1
   else
     magick -size 256x256 xc:none \
@@ -1806,7 +1783,7 @@ prepareDisc = function(g, force)
   if not force and discFramesReady(g.id) then
     local stamp = nil
     pcall(function() stamp = noctalia.readFile(dir .. "/src") end)
-    if stamp ~= cover then force = true end
+    if stamp ~= cover .. "|v2" then force = true end
   end
 
   if force then
@@ -1875,12 +1852,32 @@ end
 local function renderOpenCase(g, meta, cp, cw, ch)
   local badge = gameBadge(g)
   local p = launchLid
-  local lidW = math.max(4, math.floor(cw * (1 - 0.80 * p)))
+  -- Como en el repo de referencia: la tapa (la portada) gira sobre su bisagra
+  -- izquierda. Primera mitad: la portada se estrecha hasta quedar de canto.
+  -- Segunda mitad: ya pasó el canto y se ve su cara interior, oscura, que va
+  -- ensanchándose hasta ~20 % del ancho mientras la tapa termina de abrirse.
+  local inner = p >= 0.5
+  local lidW
+  if inner then
+    lidW = math.max(2, math.floor(cw * 0.20 * (2 * p - 1)))
+  else
+    lidW = math.max(2, math.floor(cw * (1 - 2 * p)))
+  end
   local trayW = math.max(1, cw - lidW)
   local bannerH = math.max(10, math.floor(ch * 0.075))
 
   local lidChildren = {}
-  if lidW >= 14 then
+  if inner then
+    -- Cara interior de la tapa: plástico oscuro con un reborde.
+    table.insert(lidChildren, ui.box({
+      width = math.max(1, lidW - 2),
+      height = math.max(2, ch - 6),
+      radius = 2,
+      fill = "#10151c",
+      border = "outline/0.45",
+      borderWidth = 1,
+    }))
+  elseif lidW >= 14 then
     local innerW = math.max(2, lidW - 4)
     local innerH = math.max(2, ch - bannerH - 4)
     local bannerChildren = {
@@ -1921,7 +1918,7 @@ local function renderOpenCase(g, meta, cp, cw, ch)
   else
     -- De canto: se ve el canto de plástico de la tapa.
     table.insert(lidChildren, ui.box({
-      width = math.max(1, lidW - 4),
+      width = math.max(1, lidW - 2),
       height = math.max(2, ch - 4),
       radius = 1,
       fill = "#151a22",
@@ -1938,22 +1935,21 @@ local function renderOpenCase(g, meta, cp, cw, ch)
     justify = "center",
   }, lidChildren)
 
+  -- Bandeja: la mitad trasera de la caja, oscura y hundida. El disco mide lo
+  -- mismo durante toda la apertura (como DiscTray.qml: min(0,9 ancho, 0,62
+  -- alto)) y aparece en cuanto la tapa deja sitio; lleva el aro moldeado.
   local trayChildren = {}
-  local pad = math.max(4, math.floor(trayW * 0.09))
-  local plateW = math.max(2, trayW - pad * 2 - 2)
-  local plateH = math.max(2, ch - pad * 2 - 2)
-  local discSize = math.min(plateW * 0.94, plateH * 0.94)
-  if trayW >= 40 and discSize >= 24 then
+  local d = math.floor(math.min(ch * 0.62, cw * 0.72))
+  if d >= 24 and trayW >= d + 12 then
     table.insert(trayChildren, ui.column({
-      width = plateW,
-      height = plateH,
-      fill = "#161c25",
-      radius = 3,
-      border = "outline/0.45",
-      borderWidth = 1,
+      width = d + 8,
+      height = d + 8,
+      radius = math.floor((d + 8) / 2),
+      border = "outline/0.4",
+      borderWidth = 3,
       align = "center",
       justify = "center",
-    }, { renderDisc(g, discSize) }))
+    }, { renderDisc(g, d) }))
   end
 
   local tray = ui.column({
@@ -1965,7 +1961,6 @@ local function renderOpenCase(g, meta, cp, cw, ch)
     borderWidth = 1,
     align = "center",
     justify = "center",
-    padding = pad,
   }, trayChildren)
 
   return ui.row({
@@ -2277,6 +2272,24 @@ local function renderJukeboxCard(g, index)
   })
 end
 
+-- Título del panel de detalles: el logo del juego si existe como PNG con
+-- fondo transparente en game-logos/<id>.png; si no, el nombre en texto.
+local function gameTitle(g, wide)
+  local logo = homeDir() .. "/.local/share/noctalia/game-logos/" .. g.id .. ".png"
+  if noctalia.fileExists(logo) then
+    local h = wide and 145 or 90
+    return ui.image({ path = logo, width = math.floor(h * 2.6), height = h, fit = "contain" })
+  end
+  return ui.label({
+    text = g.name,
+    fontSize = wide and 26 or 20,
+    fontWeight = "bold",
+    color = "on_surface",
+    maxLines = wide and 2 or 1,
+    textAlign = wide and "start" or nil,
+  })
+end
+
 local function renderJukeboxDetails(wide)
   local g = filtered[selectedIndex + 1]
   if not g then return ui.row() end
@@ -2326,14 +2339,7 @@ local function renderJukeboxDetails(wide)
   end
 
   local children = {
-    ui.label({
-      text = g.name,
-      fontSize = wide and 26 or 20,
-      fontWeight = "bold",
-      color = "on_surface",
-      maxLines = wide and 2 or 1,
-      textAlign = wide and "start" or nil,
-    }),
+    gameTitle(g, wide),
     ui.row({ align = "center", gap = 6 }, info),
     ui.row({ align = "center", gap = 8 }, buttons),
   }
@@ -2342,12 +2348,6 @@ local function renderJukeboxDetails(wide)
       text = string.format("%d / %d", selectedIndex + 1, #filtered),
       fontSize = 11,
       color = "on_surface_variant",
-    }))
-    table.insert(children, ui.label({
-      text = "Usa ← → o las flechas del mando para cambiar de juego.",
-      fontSize = 11,
-      color = "on_surface_variant/0.8",
-      maxLines = 2,
     }))
   end
   table.insert(children, (expandedId == g.id and renderLaunchOptions()) or ui.row())
@@ -2367,6 +2367,22 @@ local function renderJukeboxStrip()
   local cards = {}
   for i = first, last do
     table.insert(cards, renderJukeboxCard(filtered[i], i - 1))
+  end
+
+  -- Deslizamiento: si la ventana se movió, las cajas empiezan un paso atrás
+  -- y se deslizan hasta su sitio. Dos separadores simétricos (el gap entre
+  -- hijos es constante) desplazan la fila centrada la mitad de su diferencia.
+  if horizontalMode then
+    local pitch = math.floor(JUKEBOX_BASE_H * COVER_RATIO) + 10
+    if jbPrevFirst ~= nil and first ~= jbPrevFirst then
+      jbSlide = jbSlide + (first - jbPrevFirst) * pitch
+      local lim = pitch * 1.5
+      if jbSlide > lim then jbSlide = lim elseif jbSlide < -lim then jbSlide = -lim end
+      ensureTicks(true)
+    end
+    jbPrevFirst = first
+    table.insert(cards, 1, ui.box({ key = "jb-slide-l", width = math.max(1, math.floor(2 * jbSlide)), height = 1 }))
+    table.insert(cards, ui.box({ key = "jb-slide-r", width = math.max(1, math.floor(-2 * jbSlide)), height = 1 }))
   end
 
   return ui.row({
@@ -2410,55 +2426,6 @@ local function renderJukebox()
     }, { renderJukeboxStrip() }),
     renderJukeboxDetails(false),
   })
-end
-
--- Rueda en el carrusel apaisado: el ui.scroll entrega (offset, maxOffset).
--- Cada paso de rueda mueve la selección y recoloca el espaciador para que las
--- cajas sigan a la misma altura; no hace falta volver a hacer reveal.
-local function onJukeboxScroll(offset, _maxOffset)
-  local off = math.floor(tonumber(offset) or 0)
-  local ok, nowRaw = pcall(noctalia.nowMs)
-  local now = ok and tonumber(nowRaw) or 0
-  if not jbInit then
-    -- Colocación inicial (reveal o primer scroll): fija el reposo.
-    jbInit = true
-    jbLastOffset = off
-    jbGuideTop = off
-    jbReveal = nil
-    return
-  end
-  if now < jbIgnoreUntil then
-    jbLastOffset = off
-    return
-  end
-  local delta = off - jbLastOffset
-  if delta == 0 then return end
-  jbLastOffset = off
-  jbScrollAccum = jbScrollAccum + delta
-  -- Un paso de rueda típico son ~50 px; así una muesca mueve un juego.
-  local step = 50
-  local moves = 0
-  while math.abs(jbScrollAccum) >= step do
-    if jbScrollAccum > 0 then
-      moves = moves + 1
-      jbScrollAccum = jbScrollAccum - step
-    else
-      moves = moves - 1
-      jbScrollAccum = jbScrollAccum + step
-    end
-  end
-  if moves == 0 or #filtered == 0 then return end
-  selectedIndex = selectedIndex + moves
-  if selectedIndex < 0 then selectedIndex = #filtered - 1 end
-  if selectedIndex >= #filtered then selectedIndex = 0 end
-  expandedId = nil
-  optionIndex = 0
-  hoveredId = nil
-  ensureTicks(true)
-  -- Mantiene el carrusel a la misma altura con el offset nuevo.
-  jbGuideTop = off
-  jbScrollAccum = 0
-  render()
 end
 
 -- Barra de desplazamiento horizontal del carrusel: una pista con un tramo por
@@ -2999,24 +2966,10 @@ end
 function onFrameTick(deltaMs)
   local dt = tonumber(deltaMs) or 16
 
-  -- Red de seguridad: si el reveal inicial no llegó a colocar el scroll,
-  -- muestra el carrusel arriba en vez de dejar el panel en negro.
-  if horizontalMode and not jbInit and jbOpenedAt > 0 then
-    local ok, nowRaw = pcall(noctalia.nowMs)
-    local now = ok and tonumber(nowRaw) or 0
-    if now - jbOpenedAt > 1200 then
-      jbInit = true
-      jbGuideTop = 0
-      jbLastOffset = 0
-      jbReveal = nil
-      render()
-      return
-    end
-  end
-
   if launchingId then
     -- La caja abierta manda: ni hover ni crecimiento mientras se lanza.
     launchElapsed = launchElapsed + dt
+    jbSlide = 0
     -- Tapa: InOutCubic de 0 a 1 en LID_MS, como el NumberAnimation del repo.
     local t = launchElapsed / LID_MS
     if t > 1 then t = 1 end
@@ -3051,6 +3004,14 @@ function onFrameTick(deltaMs)
   local k = 1 - (0.001 ^ (dt / 220))
   local focus = focusedGame()
   local moving = false
+  -- Deslizamiento del carrusel hacia su sitio (un poco más rápido que el
+  -- crecimiento de las cajas, como el scroll del repo de referencia).
+  if jbSlide ~= 0 then
+    local ks = 1 - (0.001 ^ (dt / 170))
+    jbSlide = jbSlide * (1 - ks)
+    if math.abs(jbSlide) < 1 then jbSlide = 0 end
+    moving = true
+  end
   for _, g in ipairs(filtered) do
     local target = (focus and focus.id == g.id) and 1 or 0
     local v = anim[g.id] or 0
@@ -3233,6 +3194,10 @@ function onOpen(context)
   if type(cached) == "table" and #cached > 0 then
     games = cached
     coverExists = {}
+    -- La lista cacheada puede ser anterior a un .desktop nuevo (o a una
+    -- entrada añadida a DESKTOP_GAMES): se reenganchan aquí para que salgan
+    -- sin esperar a un reescaneo.
+    pcall(appendDesktopGames)
     filterGames(searchText)
     local wanted = noctalia.state.get(STATE_SELECTED)
     if type(wanted) == "string" and #wanted > 0 then
@@ -3401,11 +3366,11 @@ function onIpc(event, payload)
   elseif event == "status" then
     local jbFirst, jbLast = jukeboxRange()
     noctalia.log(string.format(
-      "game-launcher status: vista=%s horiz=%s tab=%s path=[%s] disks=%s entradas=%d visibles=%d browseSel=%d gameSel=%d err=[%s] juegos=%d filtrados=%d jbBase=%d jbVis=%d jbRango=%d-%d jbInit=%s jbTop=%d jbLast=%d jbRev=%s",
+      "game-launcher status: vista=%s horiz=%s tab=%s path=[%s] disks=%s entradas=%d visibles=%d browseSel=%d gameSel=%d err=[%s] juegos=%d filtrados=%d jbBase=%d jbVis=%d jbRango=%d-%d jbSlide=%d",
       viewMode, tostring(horizontalMode), activeTab, browsePath, tostring(browseDisks), #browseEntries, #browseFiltered,
       browseIndex, selectedIndex, browseError, #games, #filtered,
       JUKEBOX_BASE_H, horizontalMode and JUKEBOX_VISIBLE_WIDE or JUKEBOX_VISIBLE, jbFirst, jbLast,
-      tostring(jbInit), jbGuideTop, jbLastOffset, tostring(jbReveal)))
+      math.floor(jbSlide)))
   elseif event == "names" then
     -- Diagnóstico: lista los juegos realmente visibles (nombre[y runner])
     local out = {}
@@ -3456,6 +3421,14 @@ function onIpc(event, payload)
     end
     render()
   elseif event == "nav" then
+    -- Diagnóstico: confirma que la orden del mando llega a ESTA ventana y en
+    -- qué estado la encuentra.
+    pcall(function()
+      noctalia.log(string.format(
+        "game-launcher nav: [%s] horiz=%s vista=%s pestana=%s juegos=%d sel=%d opciones=%s",
+        tostring(arg), tostring(horizontalMode), tostring(viewMode), tostring(activeTab),
+        #filtered, selectedIndex, tostring(expandedId)))
+    end)
     -- Mando (gamepad) o CLI: mueve la selección de la vitrina o de
     -- "Examinar". Payload: up, down, left, right, enter, back, options,
     -- pageup, pagedown.
@@ -3463,14 +3436,38 @@ function onIpc(event, payload)
       if expandedId then stepLaunchOption(-1) else onKey("Up", true) end
     elseif arg == "down" or arg == "next" then
       if expandedId then stepLaunchOption(1) else onKey("Down", true) end
-    elseif arg == "left" or arg == "tabprev" or arg == "tab_prev" then
+    elseif arg == "left" then
+      -- En el carrusel horizontal el joystick / la cruceta izquierda-derecha
+      -- mueven las cajas; en el resto de vistas cambian de pestaña.
+      if expandedId then
+        stepLaunchOption(-1)
+      elseif activeTab == TAB_GAMES and (viewMode == "jukebox" or horizontalMode) then
+        moveJukebox(-1)
+      else
+        cycleTab(-1)
+      end
+    elseif arg == "right" then
+      if expandedId then
+        stepLaunchOption(1)
+      elseif activeTab == TAB_GAMES and (viewMode == "jukebox" or horizontalMode) then
+        moveJukebox(1)
+      else
+        cycleTab(1)
+      end
+    elseif arg == "tabprev" or arg == "tab_prev" then
+      -- Gatillos/bumpers: siempre cambian de pestaña, también en horizontal.
       if expandedId then stepLaunchOption(-1) else cycleTab(-1) end
-    elseif arg == "right" or arg == "tabnext" or arg == "tab_next" then
+    elseif arg == "tabnext" or arg == "tab_next" then
       if expandedId then stepLaunchOption(1) else cycleTab(1) end
     elseif arg == "back" or arg == "b" then
       -- Con las opciones abiertas, B las cierra; en "Examinar" sube de
-      -- carpeta; en el resto no hace nada.
-      if expandedId then closeLaunchOptions() else onKey("Left", true) end
+      -- carpeta; en el carrusel horizontal y en el resto no hace nada (antes
+      -- movía el carrusel a la izquierda).
+      if expandedId then
+        closeLaunchOptions()
+      elseif activeTab ~= TAB_GAMES or not (viewMode == "jukebox" or horizontalMode) then
+        onKey("Left", true)
+      end
     elseif arg == "enter" or arg == "select" or arg == "a" then
       if expandedId then confirmLaunchOption() else onKey("Return", true) end
     elseif arg == "options" or arg == "y" then
@@ -3498,6 +3495,16 @@ function jumpRow(step)
   selectedIndex = selectedIndex + step
   if selectedIndex < 0 then selectedIndex = 0 end
   if selectedIndex >= #filtered then selectedIndex = #filtered - 1 end
+  if viewMode == "jukebox" or horizontalMode then
+    -- Carrusel: salta varias cajas de golpe; las opciones abiertas eran de
+    -- otro juego.
+    expandedId = nil
+    optionIndex = 0
+    hoveredId = nil
+    ensureTicks(true)
+    render()
+    return
+  end
   ensureSelVisible()
   revealSelected()
   ensureTicks(true)
@@ -3529,6 +3536,11 @@ end
 
 function onKey(chord, pressed)
   if not pressed then return end
+  if horizontalMode then
+    pcall(function()
+      noctalia.log("game-launcher key: [" .. tostring(chord) .. "] pestana=" .. tostring(activeTab))
+    end)
+  end
 
   if activeTab == TAB_BROWSE or activeTab == TAB_ADD then
     -- En el paso del nombre, las flechas y Enter son del campo de texto.

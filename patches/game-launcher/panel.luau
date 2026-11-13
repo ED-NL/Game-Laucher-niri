@@ -287,6 +287,7 @@ local DESKTOP_GAMES = {
   "mortal-shell-2-gamescope",
   "ctr-nitro-fueled",
   "infamous-second-son",
+  "hookshot",
 }
 
 local function parseDesktopEntry(id)
